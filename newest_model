@@ -1,0 +1,1969 @@
+import os
+import time
+import platform
+import logging
+import warnings
+import sys
+import json
+import re
+import operator
+from glob import glob
+from typing import List, Tuple, Dict, Any, Optional
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import sklearn
+from packaging import version
+from sklearn.base import BaseEstimator, clone
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.calibration import calibration_curve, CalibrationDisplay
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import (
+    make_scorer, cohen_kappa_score, roc_auc_score, average_precision_score,
+    brier_score_loss, ConfusionMatrixDisplay, accuracy_score, RocCurveDisplay)
+from joblib import dump
+from tqdm import tqdm
+
+import xgboost as xgb
+
+# --- Optional Dependencies ---
+'''
+try:
+    from iterstrat.ml_stratifiers import StratifiedGroupKFold
+    STRATIFIED_GROUP_K_FOLD_AVAILABLE = True
+except ImportError:
+    STRATIFIED_GROUP_K_FOLD_AVAILABLE = False
+    logging.warning("iterstrat not found. Falling back to StratifiedKFold. Grouped CV will not be used.")
+'''
+try:
+    import mord
+    MORD_AVAILABLE = True
+except ImportError:
+    mord = None
+    MORD_AVAILABLE = False
+    logging.warning("mord not found. The Ordinal Logistic Regression model will be skipped.")
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    shap = None
+    SHAP_AVAILABLE = False
+    logging.warning("shap not found. SHAP analysis will be skipped.")
+
+
+# ============================== CONSTANTS & CONFIGURATION =======================================
+
+# --- User-Provided Column Names ---
+COL_ID = 'ODIN_ID'; COL_TRAUMA_DATETIME = 'Start_of_Disease'; COL_TRAUMA_YEAR = 'Trauma_Year'
+COL_TRAUMA_UNCERTAINTY = 'Range_of_uncertainty_of_trauma_time(hrs)'; COL_ICU_TIME = 'Time'
+COL_OUTCOME = 'Outcome - Extended Glasgow Outcome Scale (uppföljning)'
+COL_GOSE_FOLLOWUP_MONTHS = "Number of months from registration date (follow-up)"
+COL_DC_TYPE = 'DC_type'; COL_DC_TIME = 'Time_from_TBI_to_DC_in_days'; COL_GCS_EYE_TEXT = 'Eye Response'
+COL_GCS_VERBAL_TEXT = 'Verbal Response'; COL_GCS_MOTOR_TEXT = 'Motor Response'
+COL_PUPIL_L_REACT = 'Left pupil reaction'; COL_PUPIL_R_REACT = 'Right pupil reaction'
+COL_PUPIL_L_SIZE = 'PUPIL_LEFT_SIZE'; COL_PUPIL_R_SIZE = 'PUPIL_RIGHT_SIZE'
+COL_MARSHALL_SCORE = 'marshall'; COL_DATE_OF_DEATH = 'Date_of_death'
+
+# --- Derived Column Names ---
+COL_TARGET_GOSE_1_8 = 'GOSE_1_8'; COL_TARGET_ORDINAL_0_6 = 'GOSE_Ordinal_0_6'
+COL_TARGET_MORTALITY = 'Mortality'; COL_TARGET_FAVORABLE = 'FavorableOutcome'
+COL_TIME_AFTER_TRAUMA = 'time_from_trauma'; COL_PUPIL_REACT_COMBINED = 'Pupil_Reactivity_Combined'
+COL_GCS_EYE_SCORE = 'Eye_Score'; COL_GCS_VERBAL_SCORE = 'Verbal_Score'; COL_GCS_MOTOR_SCORE = 'Motor_Score'; COL_GCS_SUM = 'GCS_Sum'
+
+# --- Model Names ---
+MODEL_XGB = "XGBoost"; MODEL_ORDINAL = "OrdinalLogistic"
+
+# --- Main Configuration Dictionary ---
+CONFIG = {
+    "RUN_INFO": {"RUN_ID": time.strftime("%Y%m%d_%H%M%S"), "OUTPUT_FOLDER": f"./output/GOSE_Prediction_v10.1_{time.strftime('%Y%m%d_%H%M%S')}/"},
+    "FILE_PATHS": {"MASTER_FILE_PATH": "./data/RawICUData/master_file.csv", "ICU_DATA_FOLDER": "./data/RawICUData/"},
+    "DATA_PROCESSING": {"TEST_SET_FRACTION": 0.25, "GOSE_FOLLOWUP_MAX_MONTHS": 12, "MAX_TRAUMA_UNCERTAINTY_HRS": 6},
+    "FEATURE_ENGINEERING": {
+        "PREDICTION_LANDMARKS_HOURS": [24, 48],
+        "DYNAMIC_VARS": ["ICPm", "CPP", "BPm", "PRx", "dCPPopt"],
+        "EVENT_BURDEN_VARS": {
+            'icpm': {'above': [20, 25], 'below': [10]},
+            'cpp': {'below': [60, 50]},
+            'bpm': {'above': [120]}
+        },
+        "BEGIN_WINDOW_HOURS": 24, "END_WINDOW_HOURS": 8,
+        "PLAUSIBLE_RANGES": {
+            "ICPm": (0, 100), "BPm": (20, 160), "CPP": (0, 150), "PRx": (-1, 1),
+        },
+        "MAX_FFILL_MINUTES": 15, "MIN_DATA_POINTS_PER_VAR": 5,
+        "EVENT_SIGNATURE": {
+            "ICP_GT_MAIN": 25.0,
+            "RECOVERY_TO_ICP": 20.0,
+            "CPP_LT_MAIN": 50.0,
+            "PRX_GT_MAIN": 0.3,
+            "MIN_EPISODE_MINUTES": 5,
+            "MERGE_GAP_MINUTES": 2,
+            "RECOVERY_STABILITY_MIN": 5,
+            "ICP_PEAK_BINS": [25.0, 30.0, 40.0],
+            "DURATION_BINS_MIN": [5, 15, 60]
+}
+    },
+    "MODELING": {
+        "RANDOM_STATE": 1, "CV_SPLITS": 5, "HYPERPARAM_N_ITER": 30, "N_JOBS": -1,
+        "PARAM_GRIDS": {
+            MODEL_XGB: {'classifier__n_estimators': [200, 300, 400], 'classifier__max_depth': [3, 4],
+                'classifier__learning_rate': [0.03, 0.06, 0.1], 'classifier__subsample': [0.6, 0.7, 0.8],
+                'classifier__colsample_bytree': [0.6, 0.7, 0.8], 'classifier__gamma': [0.5, 1.0, 2, 5],
+                'classifier__reg_lambda': [3, 5, 10], 'classifier__reg_alpha': [0, 0.5, 1],
+                "classifier__min_child_weight": [10, 20, 30]
+            },
+            MODEL_ORDINAL: {
+                'classifier__alpha': np.logspace(-3, 2, 6)
+            }
+        }
+    },
+    "ARTIFACTS": {"SHAP_SAMPLE_SIZE": 1000, "BOOTSTRAP_N": 1000, "GOSE_ORDINAL_LABELS": {0: "Dead/VS", 1: "Sev-L", 2: "Sev-H", 3: "Mod-L", 4: "Mod-H", 5: "Good-L", 6: "Good-H"}},
+    "FEATURE_SELECTION": {"ENABLE_ICU_SELECTION": True, "TOP_N_ICU_FEATURES": 25} # Select the 25 most important ICU features
+    
+}
+
+# --- Feature Lists ---
+
+USER_PROVIDED_FEATURES = {
+    "numeric_baseline": [
+        "Age",
+        COL_GCS_EYE_SCORE,
+        COL_GCS_SUM,
+        COL_GCS_MOTOR_SCORE,
+        COL_PUPIL_L_SIZE,
+        COL_PUPIL_R_SIZE,
+        COL_GCS_VERBAL_SCORE,
+        COL_DC_TIME,
+        COL_MARSHALL_SCORE
+    ],
+    "categorical_baseline": [
+        "CT findings upon arrival",
+        COL_DC_TYPE,
+        "Fracture open or closed",
+        "Gender",
+        "Mechanism of injury",
+        "RLS",
+        "Referring hospital",
+        "Type of ischemia",
+        "Type of paresis",
+        "Type of previous brain injury/illness",
+        "Vehicle",
+        COL_PUPIL_REACT_COMBINED,
+        "Driver",
+        COL_GCS_EYE_TEXT,
+        COL_GCS_VERBAL_TEXT,
+        COL_GCS_MOTOR_TEXT
+    ],
+    "binary_baseline": [
+        "Abdomen",
+        "Alcoholism",
+        "Anticoagulants",
+        "Barbiturater",
+        "CT images reviewed",
+        "DC_local_hospital",
+        "Diabetes",
+        "Emergency surgery at local hospital",
+        "Extensive bleeding",
+        "Extremities",
+        "Face",
+        "Hypertension/Cardiovascular disease",
+        "Hypothermia associated with the accident",
+        "Influence of alcohol/drugs at the time of accident",
+        "Other injuries assessed",
+        "Paresis",
+        "Pelvis",
+        "Previous brain injury/illness",
+        "Severe global ischemia after the accident",
+        "Spinal cord injury",
+        "Spinal injury",
+        "Thorax",
+        "Was the patient transported by air ambulance?",
+        COL_PUPIL_L_REACT,
+        COL_PUPIL_R_REACT
+    ]
+}
+
+GOSE_TEXT_TO_NUMERIC_MAP = {
+    "dead": 1, "vegetative state": 2, "vs": 2,
+    "severe disability lower sd-l": 3, "sd-l": 3,
+    "severe disability higher sd-h": 4, "sd-h": 4,
+    "moderate disability lower md-l": 5, "md-l": 5,
+    "moderate disability higher md-h": 6, "md-h": 6,
+    "good recovery lower gr-l": 7, "gr-l": 7,
+    "good recovery higher gr-h": 8, "gr-h": 8,
+}
+
+GOSE_1_8_TO_ORDINAL_0_6_MAP = {1: 0, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6}
+
+# ============================== SETUP & HELPERS =======================================
+# This function prepares the workspace for the analysis. It creates a new folder to save all results,
+# sets up a log file to record every step the program takes, and saves the settings used for this specific run.
+def setup_environment(cfg: Dict):
+    os.makedirs(cfg["RUN_INFO"]["OUTPUT_FOLDER"], exist_ok=True)
+    log_file = os.path.join(cfg["RUN_INFO"]["OUTPUT_FOLDER"], "pipeline.log")
+
+    # Force reconfigure root logger (works on Python 3.8+)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+                        handlers=[], force=True)
+
+    # Build handlers explicitly
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fh = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.addHandler(fh)
+    root.addHandler(sh)
+
+    # Pipe Python warnings into logging (so those big sklearn messages land in the file)
+    logging.captureWarnings(True)
+    warnings.simplefilter("default")
+
+    logging.info(f"--- Starting Pipeline --- Run ID: {cfg['RUN_INFO']['RUN_ID']} ---")
+    logging.info("Artifacts → %s", os.path.abspath(cfg["RUN_INFO"]["OUTPUT_FOLDER"]))
+    with open(os.path.join(cfg["RUN_INFO"]["OUTPUT_FOLDER"], "config.json"), "w", encoding="utf-8") as f:
+        json.dump(json.loads(json.dumps(cfg, default=str)), f, indent=4)
+
+# This function cleans up text, like column headers from a data table. It removes spaces,
+# special characters, and ensures the name doesn't start with a number, making it safe for the program to use.
+def sanitize_name(name: str) -> str:
+    return re.sub(r'\W|^(?=\d)', '_', str(name))
+
+
+# This is a statistical method to assess the reliability of a performance metric (like AUC).
+# It works by repeatedly creating new, slightly different patient groups from the original data
+# and calculating the metric for each. This process generates a 95% confidence interval, giving us
+# a range of plausible values for the metric, not just a single number.
+def bootstrap_metric(y_true, y_pred, metric_func, n_bootstraps=1000, random_state=42, **kwargs):
+    rng = np.random.RandomState(random_state); n = len(y_true); bootstrapped_scores = []
+    for _ in range(n_bootstraps):
+        indices = rng.choice(np.arange(n), size=n, replace=True)
+        if len(np.unique(y_true[indices])) < 2 and metric_func in (roc_auc_score, average_precision_score): continue
+        if len(indices) > 0:
+            bootstrapped_scores.append(metric_func(y_true[indices], y_pred[indices], **kwargs))
+    if not bootstrapped_scores: return metric_func(y_true, y_pred, **kwargs), np.nan, np.nan
+    point_estimate = metric_func(y_true, y_pred, **kwargs)
+    lower = np.percentile(bootstrapped_scores, 2.5); upper = np.percentile(bootstrapped_scores, 97.5)
+    return point_estimate, lower, upper
+
+# This function reads a data table (like a CSV file) from the ICU files. It's built to be flexible,
+# automatically trying to figure out how the data is separated (e.g., by commas or semicolons)
+# and to avoid crashing if it encounters a file it can't read.
+def read_icu_table(path: str) -> pd.DataFrame | None:
+    try:
+        df = pd.read_csv(path, sep='[,;]', engine='python', encoding_errors='ignore')
+        if df.shape[1] > 1 and len(df) > 0: return df
+    except Exception: pass
+    try:
+        df = pd.read_csv(path, sep=None, engine='python', encoding_errors='ignore')
+        if df.shape[1] > 1 and len(df) > 0: return df
+    except Exception as e:
+        logging.warning(f"[ICU] Failed to parse {os.path.basename(path)}. Error: {e}")
+        return None
+
+# This function makes sure that each ICU data table has a proper, standardized timestamp column.
+# It intelligently searches for columns that likely represent time (e.g., 'time', 'clock',
+# or a combination of 'date' and 'tid') and converts them into a consistent format that the
+# program can use for time-based analysis.
+def ensure_icu_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    s_icu_time = sanitize_name(COL_ICU_TIME)
+    if s_icu_time in df.columns:
+        # <<< FIX 4: PERFORMANCE NICETY >>> Add cache=True to speed up parsing of repeated non-standard datetime strings
+        df[s_icu_time] = pd.to_datetime(df[s_icu_time], errors='coerce', cache=True)
+        return df
+    time_candidates = [c for c in df.columns if any(k in c.lower() for k in ['time', 'tid', 'timestamp', 'clock'])]
+    if time_candidates:
+        dt_col = time_candidates[0]
+        date_candidates = [c for c in df.columns if 'date' in c.lower() and c != dt_col]
+        if date_candidates:
+            df[s_icu_time] = pd.to_datetime(df[date_candidates[0]].astype(str) + ' ' + df[dt_col].astype(str), errors='coerce', cache=True)
+        else:
+            df[s_icu_time] = pd.to_datetime(df[dt_col], errors='coerce', cache=True)
+    return df
+
+# This function cleans the ICU data by removing clinically implausible values. For example,
+# it can be set to remove a heart rate of 500 or a blood pressure of 0. It replaces these
+# out-of-range values with a 'missing' marker, so they don't corrupt the analysis.
+def filter_plausible_icu_values(df_icu: pd.DataFrame, value_filters: Dict[str, Tuple[float, float]]) -> pd.DataFrame:
+    df_filtered = df_icu.copy()
+    for col, (min_val, max_val) in value_filters.items():
+        s_col = sanitize_name(col)
+        if s_col in df_filtered.columns:
+            numeric_col = pd.to_numeric(df_filtered[s_col], errors='coerce')
+            mask = (numeric_col < min_val) | (numeric_col > max_val)
+            num_removed = mask.sum()
+            if num_removed > 0:
+                df_filtered.loc[mask, s_col] = np.nan
+                logging.debug(f"[Filter] Removed {num_removed} implausible values from '{s_col}' (range: {min_val}-{max_val}).")
+    return df_filtered
+
+# This function handles short gaps in time-series data (like vital signs). If a measurement is missing,
+# it 'carries forward' the last known value, but only for a limited time (e.g., for up to 30 minutes).
+# This prevents us from assuming a value is stable for too long when we don't have a new measurement.
+def local_forward_fill(df: pd.DataFrame, time_col: str, data_cols: List[str], max_ffill_minutes: int) -> pd.DataFrame:
+    if df.empty or max_ffill_minutes <= 0: return df
+    df_sorted = df.set_index(time_col).sort_index()
+    df_ffilled = df_sorted[data_cols].resample('1min').ffill(limit=max_ffill_minutes)
+    df_reindexed = df_ffilled.reindex(df_sorted.index)
+    return df_reindexed.reset_index()
+
+# This function removes variables (columns) from the dataset that have too much missing data.
+# For example, if a lab test was only performed on 10% of patients, this function would remove
+# that variable because it's not informative enough for the model.
+def drop_sparse_columns(df: pd.DataFrame, min_frac: float = 0.25) -> pd.DataFrame:
+    if df.empty: return df
+    thresh = int(np.ceil(min_frac * len(df)))
+    counts = df.notna().sum()
+    keep = counts[counts >= thresh].index
+    drop = counts[counts <  thresh].index
+    if len(drop):
+        logging.info(f"Dropping {len(drop)} sparse columns (<{min_frac:.0%} coverage): {list(drop)[:12]}...")
+    return df[keep]
+
+# This function performs a 'clinical sanity check' on the processed data before building the model.
+# It compares the average values of key features (like ICP) between patients with favorable outcomes
+# and those with poor outcomes. This helps confirm that our data processing hasn't introduced errors
+# and that the data reflects expected clinical patterns (e.g., that average ICP is generally
+# higher in patients who do poorly).
+def perform_sanity_check_on_features(
+    dynamic_features_df: pd.DataFrame,
+    y_data: pd.DataFrame,
+    features_to_check: List[str],
+    outcome_col: str = COL_TARGET_FAVORABLE,
+    group_name: str = "Training Set"
+):
+    """
+    Performs an automated sanity check by comparing summary stats of key features
+    between good and poor outcome groups.
+    """
+    logging.info(f"\n--- Automated Sanity Check for Dynamic Features ({group_name}) ---")
+    
+    if dynamic_features_df.empty:
+        logging.warning("  Sanity Check: Dynamic features DataFrame is empty. Skipping.")
+        return
+
+    # Align features with outcomes
+    combined_df = dynamic_features_df.join(y_data[outcome_col], how="inner")
+    
+    if combined_df.empty:
+        logging.warning("  Sanity Check: No overlapping patients between features and outcomes. Skipping.")
+        return
+        
+    combined_df[outcome_col] = combined_df[outcome_col].map({0: 'Poor_Outcome', 1: 'Favorable_Outcome'})
+    
+    # Filter to only the features we want to inspect
+    features_exist = [f for f in features_to_check if f in combined_df.columns]
+    if not features_exist:
+        logging.warning("  Sanity Check: None of the specified features to check were found. Skipping.")
+        return
+
+    # Use groupby to calculate statistics for each group
+    summary = combined_df.groupby(outcome_col)[features_exist].agg(['mean', 'std', 'median', 'count'])
+    
+    # Transpose for better readability
+    summary = summary.T
+    
+    logging.info(f"Comparing key features between Favorable vs. Poor outcome groups:\n"
+                 f"{summary.to_string(float_format='%.2f')}\n")
+
+    # Example check: Mean ICP should be higher in the poor outcome group
+    icp_mean_feat = 'dyn_ICPm_mean'
+    if icp_mean_feat in features_exist and 'Poor_Outcome' in summary.columns and 'Favorable_Outcome' in summary.columns:
+        mean_icp_poor = summary.loc[(icp_mean_feat, 'mean'), 'Poor_Outcome']
+        mean_icp_good = summary.loc[(icp_mean_feat, 'mean'), 'Favorable_Outcome']
+        if pd.notna(mean_icp_poor) and pd.notna(mean_icp_good):
+            if mean_icp_poor > mean_icp_good:
+                logging.info(f"  [PASS] Mean ICP is higher in Poor Outcome group ({mean_icp_poor:.2f}) than Favorable ({mean_icp_good:.2f}).")
+            else:
+                logging.warning(f"  [FAIL] Mean ICP is NOT higher in Poor Outcome group ({mean_icp_poor:.2f}) than Favorable ({mean_icp_good:.2f}). Check data processing.")
+
+# ============================== DATA LOADING & PREPARATION =================================
+# This function reads the main patient information file (the 'master file') which contains baseline
+# data like demographics, injury details, and outcomes. It then performs a series of critical cleaning
+# and preparation steps to make the data consistent and ready for analysis.
+def load_and_prepare_master_data(cfg: Dict) -> Tuple[Tuple[pd.DataFrame, pd.DataFrame], List[str]]:
+    """
+    Loads and preprocesses the master file, including robust GCS parsing.
+    """
+    logging.info("--- 1. Loading and Preparing Master Data ---")
+    df_master = pd.read_csv(cfg["FILE_PATHS"]["MASTER_FILE_PATH"], sep=None, engine='python', encoding_errors='ignore')
+    sanitized_map = {orig: sanitize_name(orig) for orig in df_master.columns}
+    df_master.columns = df_master.columns.map(sanitized_map)
+
+    # --- START: NEW GCS MAPPING AND COMBINATION LOGIC ---
+    logging.info("  Processing GCS scores from text fields...")
+    
+    # Define regex mappings for each GCS component to handle text variations
+    gcs_text_to_score_map = {
+        # Eye (E) Score: 1-4
+        sanitize_name(COL_GCS_EYE_TEXT): {
+            r'.*4.*|.*spontaneously.*': 4,
+            r'.*3.*|.*speech.*|.*sound.*': 3,
+            r'.*2.*|.*pain.*': 2,
+            r'.*1.*|.*no response.*|.*none.*': 1
+        },
+        # Verbal (V) Score: 1-5
+        sanitize_name(COL_GCS_VERBAL_TEXT): {
+            r'.*5.*|.*oriented.*': 5,
+            r'.*4.*|.*confused.*': 4,
+            r'.*3.*|.*inappropriate.*': 3,
+            r'.*2.*|.*incomprehensible.*': 2,
+            r'.*1.*|.*no response.*|.*none.*|.*intubated.*': 1 # Note: Intubated is often coded as 1
+        },
+        # Motor (M) Score: 1-6
+        sanitize_name(COL_GCS_MOTOR_TEXT): {
+            r'.*6.*|.*obeys.*': 6,
+            r'.*5.*|.*localises.*|.*localizes.*': 5,
+            r'.*4.*|.*withdrawal.*': 4,
+            r'.*3.*|.*abnormal flexion.*|.*decorticate.*': 3,
+            r'.*2.*|.*extension.*|.*decerebrate.*': 2,
+            r'.*1.*|.*no response.*|.*none.*': 1
+        }
+    }
+    
+    derived_score_cols = []
+    # Loop through each GCS component to create a clean numeric score column
+    for text_col, mapping in gcs_text_to_score_map.items():
+        # Dynamically determine the target score column name from the constant
+        if 'Eye' in text_col: score_col = sanitize_name(COL_GCS_EYE_SCORE)
+        elif 'Verbal' in text_col: score_col = sanitize_name(COL_GCS_VERBAL_SCORE)
+        elif 'Motor' in text_col: score_col = sanitize_name(COL_GCS_MOTOR_SCORE)
+        else: continue # Skip if it's not a recognized GCS component
+
+        derived_score_cols.append(score_col)
+
+        if text_col in df_master.columns:
+            # Create a numeric score column by replacing text with numbers using regex
+            # We explicitly overwrite any existing score column to ensure consistency
+            series = df_master[text_col].astype(str).str.lower().replace(mapping, regex=True)
+            
+            # Convert to numeric, coercing anything that didn't map to NaN
+            df_master[score_col] = pd.to_numeric(series, errors='coerce')
+            logging.info(f"    -> Created/Updated '{score_col}' from '{text_col}'. Found {df_master[score_col].notna().sum()} valid scores.")
+        else:
+            # If the text column doesn't exist, ensure the score column exists but is empty
+            df_master[score_col] = np.nan
+            logging.warning(f"    -> Text column '{text_col}' not found. '{score_col}' will be all NaN.")
+
+    # Recompute GCS Sum from the newly created, more reliable score columns
+    # min_count=1 means the sum is computed if at least one component is present.
+    if derived_score_cols:
+        df_master[sanitize_name(COL_GCS_SUM)] = df_master[derived_score_cols].sum(axis=1, min_count=1)
+        logging.info(f"  -> Recalculated '{sanitize_name(COL_GCS_SUM)}'. Found {df_master[sanitize_name(COL_GCS_SUM)].notna().sum()} valid sums.")
+
+    # --- END: NEW GCS MAPPING AND COMBINATION LOGIC ---
+
+    s_pupil_l, s_pupil_r = sanitize_name(COL_PUPIL_L_REACT), sanitize_name(COL_PUPIL_R_REACT)
+    binary_map = {r'(?i)^\s*(ja|yes|true|reactive|1|1\.0)\s*$': 1, r'(?i)^\s*(nej|no|false|nonreactive|non-reactive|0|0\.0)\s*$': 0}
+    for col in [s_pupil_l, s_pupil_r]:
+        if col in df_master.columns: df_master[col] = pd.to_numeric(df_master[col].replace(binary_map, regex=True), errors='coerce')
+    df_master[sanitize_name(COL_PUPIL_REACT_COMBINED)] = np.select([(df_master[s_pupil_l]==1) & (df_master[s_pupil_r]==1), (df_master[s_pupil_l]==0) & (df_master[s_pupil_r]==0)], ['Both_Reactive', 'None_Reactive'], default='One_Reactive')
+
+    # This section cleans up other important baseline patient characteristics. It ensures that variables
+    # that should be numbers (like age or our new GCS scores) are stored as numbers, and binary
+    # variables (yes/no questions) are converted to a 1/0 format.
+    sanitized_features = {ftype: [sanitize_name(f) for f in flist] for ftype, flist in USER_PROVIDED_FEATURES.items()}
+    for col in sanitized_features['binary_baseline']:
+        if col in df_master.columns: df_master[col] = pd.to_numeric(df_master[col].replace(binary_map, regex=True), errors='coerce')
+    for col in sanitized_features['numeric_baseline']:
+        # This loop now processes our newly created GCS score columns
+        if col in df_master.columns: df_master[col] = pd.to_numeric(df_master[col], errors='coerce')
+
+    s_outcome = sanitize_name(COL_OUTCOME)
+    cleaned_outcomes = df_master[s_outcome].str.lower().str.strip().str.replace(r'[^a-z0-9\s-]', '', regex=True)
+    df_master[COL_TARGET_GOSE_1_8] = cleaned_outcomes.map(GOSE_TEXT_TO_NUMERIC_MAP)
+    unmapped_mask = df_master[COL_TARGET_GOSE_1_8].isna() & df_master[s_outcome].notna()
+    if unmapped_mask.any():
+        unmapped_counts = df_master.loc[unmapped_mask, s_outcome].value_counts()
+        logging.warning(f"Found unmapped GOSE outcome values:\n{unmapped_counts.to_string()}")
+
+    df_master[COL_TARGET_ORDINAL_0_6] = df_master[COL_TARGET_GOSE_1_8].map(GOSE_1_8_TO_ORDINAL_0_6_MAP)
+    df_master[COL_TARGET_MORTALITY] = (df_master[COL_TARGET_GOSE_1_8] == 1).astype(int)
+    df_master[COL_TARGET_FAVORABLE] = (df_master[COL_TARGET_GOSE_1_8] >= 5).astype(int)
+
+    df_master = df_master[pd.to_numeric(df_master[sanitize_name(COL_GOSE_FOLLOWUP_MONTHS)], errors='coerce') <= cfg["DATA_PROCESSING"]["GOSE_FOLLOWUP_MAX_MONTHS"]]
+    
+    s_uncertainty = sanitize_name(COL_TRAUMA_UNCERTAINTY)
+    max_uncertainty = cfg["DATA_PROCESSING"]["MAX_TRAUMA_UNCERTAINTY_HRS"]
+
+    if s_uncertainty in df_master.columns:
+        uncertainty_series = pd.to_numeric(df_master[s_uncertainty], errors='coerce')
+        mask_to_keep = (uncertainty_series.isna()) | (uncertainty_series <= max_uncertainty)
+        num_before = len(df_master)
+        df_master = df_master[mask_to_keep]
+        num_after = len(df_master)
+        logging.info(f"Filtered by trauma uncertainty: Kept {num_after}/{num_before} patients (NaN or <= {max_uncertainty}hrs).")
+
+    df_master.dropna(subset=[sanitize_name(COL_ID), COL_TARGET_ORDINAL_0_6], inplace=True)
+
+    df_master[sanitize_name(COL_ID)] = df_master[sanitize_name(COL_ID)].astype(str).str.strip()
+    df_master.drop_duplicates(subset=[sanitize_name(COL_ID)], inplace=True)
+
+    # This part handles date and time information. It converts the recorded trauma and death dates
+    # into a standardized format that can be used for calculations.
+    s_trauma_dt, s_death_dt = sanitize_name(COL_TRAUMA_DATETIME), sanitize_name(COL_DATE_OF_DEATH)
+    df_master[s_trauma_dt] = pd.to_datetime(df_master[s_trauma_dt], errors='coerce')
+    df_master[s_death_dt] = pd.to_datetime(df_master[s_death_dt], errors='coerce')
+    df_master[sanitize_name(COL_TRAUMA_YEAR)] = df_master[s_trauma_dt].dt.year
+    for h in cfg["FEATURE_ENGINEERING"]["PREDICTION_LANDMARKS_HOURS"]:
+        df_master[f'Died_within_{h}h'] = (df_master[s_death_dt] - df_master[s_trauma_dt]) <= pd.to_timedelta(h, 'h')
+
+    df_master.set_index(sanitize_name(COL_ID), inplace=True)
+    raw_baseline_feats = sum([v for k, v in sanitized_features.items()], [])
+
+    # To properly test our model's performance on new, unseen patients, we split the data into a
+    # 'training set' and a 'testing set'. This is done based on the date of injury (a 'temporal split').
+    # All patients injured before a certain date are used to build the model (training), and all patients
+    # injured after that date are used to evaluate it (testing). This mimics how the model would be used
+    # in real-time, making predictions on future patients.
+    dates = df_master[s_trauma_dt].dropna().sort_values()
+    split_date = dates.quantile(1 - cfg["DATA_PROCESSING"]["TEST_SET_FRACTION"], interpolation='lower')
+    train_pids = df_master.index[df_master[s_trauma_dt] <= split_date]
+    test_pids  = df_master.index[df_master[s_trauma_dt] > split_date]
+    logging.info(f"Temporal split on {split_date.date()}: {len(train_pids)} train, {len(test_pids)} test patients.")
+
+    return (df_master.loc[train_pids], df_master.loc[test_pids]), raw_baseline_feats
+
+
+# ============================== FEATURE ENGINEERING =================================
+# This function prepares the baseline patient data for analysis at a specific point in time
+# after injury, which we call a 'landmark' (e.g., 24 hours). Its main job is to handle
+# information about Decompressive Craniectomy (DC) correctly, so we don't accidentally use
+# future information to make a prediction. For example, to predict an outcome at 24 hours,
+# we should only know if a DC happened *before* 24 hours, not after.
+def build_baseline_for_landmark(master_df: pd.DataFrame, raw_baseline_feats: List[str], h: int) -> pd.DataFrame:
+    df = master_df.copy()
+    s_dc_time, s_dc_type = sanitize_name(COL_DC_TIME), sanitize_name(COL_DC_TYPE)
+
+    # start from the raw baseline list, but exclude original DC cols
+    feats = [f for f in raw_baseline_feats if not f.startswith('Died_within_') and f not in {s_dc_time, s_dc_type}]
+
+    if s_dc_time in df.columns:
+        # days -> hours, drop negatives as invalid
+        dc_hours = pd.to_numeric(df[s_dc_time], errors='coerce') * 24.0
+        dc_hours = dc_hours.mask(dc_hours < 0)  # treat negative values as missing
+
+        dc_by_landmark = (dc_hours <= float(h))
+        df[f'DC_by_{h}h'] = dc_by_landmark.astype('float')  # 1.0/0.0
+
+        # only reveal time if DC occurred by the landmark (censored otherwise)
+        df[f'DC_time_if_by_{h}h'] = np.where(dc_by_landmark, dc_hours, np.nan)
+
+        feats += [f'DC_by_{h}h', f'DC_time_if_by_{h}h']  # (append once)
+
+        if s_dc_type in df.columns:
+            # keep original type when DC is by the landmark, otherwise explicit "No_DC_by_landmark"
+            df[f'DC_type_by_{h}h'] = df[s_dc_type].where(dc_by_landmark, 'No_DC_by_landmark').astype(str)
+            feats.append(f'DC_type_by_{h}h')
+
+    # return only the features that exist in the frame
+    return df[[f for f in feats if f in df.columns]]
+
+# ======================== ENHANCED FEATURE ENGINEERING HELPERS ========================
+# This is a small helper function that standardizes time-series data. Imagine vital signs are
+# recorded at irregular times (e.g., 08:03, 08:17, 08:21). This function creates a perfectly
+# regular, minute-by-minute timeline for each patient and places the measurements on it. It
+# also handles small gaps by carrying the last known value forward for a few minutes.
+def _grid_align(s: pd.Series, grid_index: pd.TimedeltaIndex, ffill_minutes: int) -> pd.Series:
+    """Align irregular Timedelta series to a 1-min grid with limited forward fill."""
+    s = pd.to_numeric(s, errors='coerce').dropna()
+    if s.empty:
+        return pd.Series(index=grid_index, dtype=float)
+    s = s.sort_index()
+
+    # Upsample to 1-min, forward-fill short gaps (limit in minutes)
+    g = s.resample('1min').ffill(limit=ffill_minutes)
+
+    # Match the requested [0..H] grid exactly
+    g = g.reindex(grid_index)
+    return g
+
+
+# This function calculates the 'burden' of a single physiological variable. For example,
+# it can answer the question: "What percentage of the first 24 hours did this patient spend
+# with an Intracranial Pressure (ICP) above 20 mmHg?". It takes the patient's data, a
+# clinical threshold (e.g., 20 mmHg), and a direction ('above' or 'below') to calculate this burden,
+# correctly ignoring any periods where monitoring data was missing.
+def _single_burden(
+    s: pd.Series,
+    direction: str,
+    thr: float,
+    grid_index: pd.TimedeltaIndex,
+    ffill_minutes: int,
+    mode: str = "observed_fraction",
+    min_obs_minutes: int = 0,
+) -> float:
+    
+    if direction not in {"above", "below"}:
+        return np.nan
+
+    # Align to 1-min grid with limited forward fill
+    g = _grid_align(s, grid_index, ffill_minutes)
+
+    # Minutes where data are present
+    obs = g.notna()
+    obs_minutes = int(obs.sum())
+    if obs_minutes < int(min_obs_minutes):
+        return np.nan
+
+    # Condition mask
+    g_num = pd.to_numeric(g, errors="coerce")
+    if direction == "above":
+        cond = g_num > float(thr)
+    else:
+        cond = g_num < float(thr)
+
+    if mode == "absolute_minutes":
+        return float((cond & obs).sum())
+
+    # Default: fraction over observed minutes
+    if obs_minutes == 0:
+        return np.nan
+    return float((cond & obs).sum()) / float(obs_minutes)
+
+# This function calculates a 'joint burden' for two variables simultaneously. It's used to
+# identify periods of secondary injury, for instance, by answering: "What percentage of
+# time did the patient suffer from BOTH high ICP (above 20) AND low blood pressure (below 90)
+# at the same time?". This helps us quantify the duration of more complex and dangerous physiological states.
+def _joint_burden(
+    s1: pd.Series,
+    direction1: str,
+    thr1: float,
+    s2: pd.Series,
+    direction2: str,
+    thr2: float,
+    grid_index: pd.TimedeltaIndex,
+    ffill_minutes: int,
+    mode: str = "observed_fraction",
+    min_obs_minutes: int = 0,
+) -> float:
+    
+    # Validate directions
+    if direction1 not in {"above", "below"} or direction2 not in {"above", "below"}:
+        return np.nan
+
+    # Align each series to the 1-min grid with limited forward fill
+    g1 = _grid_align(s1, grid_index, ffill_minutes)
+    g2 = _grid_align(s2, grid_index, ffill_minutes)
+
+    # Observed where both present
+    obs = g1.notna() & g2.notna()
+    obs_minutes = int(obs.sum())
+    if obs_minutes < int(min_obs_minutes):
+        return np.nan
+
+    # Build per-minute condition masks (NaNs compare False, but we gate by obs anyway)
+    m1 = (g1 > float(thr1)) if direction1 == "above" else (g1 < float(thr1))
+    m2 = (g2 > float(thr2)) if direction2 == "above" else (g2 < float(thr2))
+    joint = m1 & m2
+
+    if mode == "absolute_minutes":
+        # Count minutes where both conditions are met and data exist for both series
+        return float((joint & obs).sum())
+
+    # Default: fraction over observed minutes
+    denom = obs_minutes
+    if denom == 0:
+        return np.nan
+    return float((joint & obs).sum()) / float(denom)
+
+# This function categorizes and counts physiological 'episodes' (like spikes in ICP) based on their
+# severity (peak value) and their duration. Think of it as creating a grid where one axis is the
+# peak ICP (e.g., 20-25, 25-30 mmHg) and the other is the duration (e.g., 5-15 min, 15-30 min).
+# It then counts how many of a patient's episodes fall into each box, giving a summary like
+# '3 short, mild episodes' and '1 long, severe episode'.
+def _episode_grid_counts(peaks: List[float],
+                         durs: List[int],
+                         peak_bins: List[float],
+                         dur_bins: List[int]) -> Dict[str, int]:
+    """
+    Count episodes across peak x duration bins.
+    Returns dict with keys like 'count_p25_30_d5_15', using closed-open bins.
+    """
+    out: Dict[str, int] = {}
+    if not peaks or not durs:
+        return out
+    p = np.asarray(peaks, dtype=float)
+    d = np.asarray(durs, dtype=int)
+
+    p_idx = np.digitize(p, peak_bins, right=False)  # 0..len(bins)
+    d_idx = np.digitize(d, dur_bins, right=False)
+    # Build bin label helper
+    def _label_edges(edges, i, suffix):
+        if i == 0:
+            return f"{suffix}lt{edges[0]}"
+        elif i == len(edges):
+            return f"{suffix}ge{edges[-1]}"
+        else:
+            return f"{suffix}{edges[i-1]}_{edges[i]}"
+
+    for i in range(p_idx.size):
+        pi, di = p_idx[i], d_idx[i]
+        p_lab = _label_edges(peak_bins, pi, "p")
+        d_lab = _label_edges(dur_bins,  di, "d")
+        key = f"count_{p_lab}_{d_lab}"
+        out[key] = out.get(key, 0) + 1
+    return out
+
+# -------------------------- EVENT SIGNATURE HELPERS ---------------------------
+
+# This is a helper function that identifies 'episodes' from a minute-by-minute data stream.
+# For example, if we have a record of when a patient's ICP was above 20 mmHg, this function
+# will find the start and end times of each continuous period of high ICP. It can also merge
+# two episodes that are very close together and ignore very short spikes that might just be noise.
+def _extract_episode_runs(mask: pd.Series, min_len: int = 1, merge_gap: int = 0) -> List[Tuple[int, int]]:
+    """
+    Given a boolean mask over a 1-min grid (index 0..H in TimedeltaIndex), return
+    list of (start_idx, end_idx) inclusive minute indices of True-runs.
+    min_len: minimum run length (in minutes) to keep.
+    merge_gap: merge two runs if separated by <= merge_gap minutes of False.
+    """
+    if mask is None or mask.empty:
+        return []
+    m = mask.fillna(False).to_numpy(dtype=bool)
+    n = m.size
+    runs = []
+    i = 0
+    while i < n:
+        if not m[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and m[j + 1]:
+            j += 1
+        runs.append([i, j])  # inclusive
+        i = j + 1
+
+    # Merge runs separated by small gaps
+    if merge_gap > 0 and runs:
+        merged = [runs[0]]
+        for s, e in runs[1:]:
+            prev_s, prev_e = merged[-1]
+            gap = s - prev_e - 1
+            if gap <= merge_gap:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+        runs = merged
+
+    # Enforce minimum duration
+    kept = []
+    for s, e in runs:
+        dur = (e - s + 1)
+        if dur >= int(min_len):
+            kept.append((s, e))
+    return kept
+
+# Once the episodes (like high ICP events) have been identified, this powerful function calculates
+# a detailed summary of them. It's like creating a clinical signature of the patient's instability.
+# It measures things like: the total number of episodes, how long they lasted on average, the most
+# severe value reached (e.g., peak ICP), how long it took for the first episode to occur, and even
+# how long it took for the patient's physiology to return to a 'safe' level after an episode.
+def _episode_metrics_from_mask(values: pd.Series,
+                               mask: pd.Series,
+                               grid_index: pd.TimedeltaIndex,
+                               *,
+                               peak_mode: str = "max",
+                               recovery_to: Optional[float] = None,
+                               recovery_stability: int = 5) -> Dict[str, Any]:
+    """
+    Compute episode metrics for a 1-min grid-aligned series.
+    values: numeric series aligned to 1-min grid [0..H].
+    mask: boolean condition (e.g., ICP > 25) on the same grid.
+    peak_mode: "max" (for 'above' insults like ICP) or "min" (for 'below' like CPP).
+    recovery_to: if provided, measure time from episode peak to first time series
+                 stays beyond 'recovery_to' in the *non-insult* direction for
+                 'recovery_stability' consecutive minutes.
+                 e.g., after ICP>25 spike, recovery_to=20 means “time to be <20
+                 for ≥5 min”.
+    Returns a dict with counts, durations, peaks, time-to-first, clustering, recovery.
+    """
+    out: Dict[str, Any] = {}
+    if values is None or values.empty or mask is None or mask.empty:
+        # Standardized empties
+        out.update({
+            "n_episodes": 0,
+            "tot_mins": 0.0,
+            "mean_dur_mins": np.nan,
+            "median_dur_mins": np.nan,
+            "p90_dur_mins": np.nan,
+            "longest_mins": np.nan,
+            "time_to_first_min": np.nan,
+            "peak_max": np.nan,
+            "peak_mean": np.nan,
+            "iei_mean_mins": np.nan,
+            "iei_cv": np.nan,
+            "iei_burstiness": np.nan,
+            "recovery_median_mins": np.nan,
+            "recovery_mean_mins": np.nan,
+        })
+        return out
+
+    g = pd.to_numeric(values, errors='coerce')
+    cond = mask.fillna(False) & g.notna()
+
+    # Build runs (episodes)
+    runs = _extract_episode_runs(cond, min_len=1, merge_gap=0)
+    n = len(runs)
+    out["n_episodes"] = int(n)
+    if n == 0:
+        out.update({
+            "tot_mins": 0.0,
+            "mean_dur_mins": 0.0,
+            "median_dur_mins": 0.0,
+            "p90_dur_mins": 0.0,
+            "longest_mins": 0.0,
+            "time_to_first_min": np.nan,
+            "peak_max": np.nan,
+            "peak_mean": np.nan,
+            "iei_mean_mins": np.nan,
+            "iei_cv": np.nan,
+            "iei_burstiness": np.nan,
+            "recovery_median_mins": np.nan,
+            "recovery_mean_mins": np.nan,
+        })
+        return out
+
+    # Durations and time-to-first
+    durs = [(e - s + 1) for s, e in runs]
+    out["tot_mins"] = float(np.sum(durs))
+    out["mean_dur_mins"] = float(np.mean(durs))
+    out["median_dur_mins"] = float(np.median(durs))
+    out["p90_dur_mins"] = float(np.quantile(durs, 0.90))
+    out["longest_mins"] = float(np.max(durs))
+    # time-to-first (episode start minute from 0)
+    first_start_idx = runs[0][0]
+    # grid index is TimedeltaIndex at 1min resolution
+    out["time_to_first_min"] = float(first_start_idx)
+
+    # Peaks within episodes
+    peaks = []
+    for s, e in runs:
+        seg = g.iloc[s:e+1]
+        if peak_mode == "min":
+            peaks.append(float(seg.min()))
+        else:
+            peaks.append(float(seg.max()))
+    out["peak_max"] = float(np.max(peaks))
+    out["peak_mean"] = float(np.mean(peaks))
+
+    # Inter-episode intervals (minutes between end of i and start of i+1)
+    if n > 1:
+        iei = [runs[i+1][0] - runs[i][1] - 1 for i in range(n - 1)]
+        iei_arr = np.asarray(iei, dtype=float)
+        out["iei_mean_mins"] = float(iei_arr.mean())
+        out["iei_cv"] = float(iei_arr.std(ddof=1) / iei_arr.mean()) if iei_arr.mean() > 0 else np.nan
+        out["iei_burstiness"] = _burstiness_from_intervals(iei)
+    else:
+        out["iei_mean_mins"] = np.nan
+        out["iei_cv"] = np.nan
+        out["iei_burstiness"] = np.nan
+
+    # Recovery metrics (optional)
+    if recovery_to is None:
+        out["recovery_median_mins"] = np.nan
+        out["recovery_mean_mins"] = np.nan
+        return out
+
+    rec_times = []
+    for s, e in runs:
+        seg = g.iloc[s:e+1]
+        # find peak idx within the episode
+        peak_idx_local = int(np.argmin(seg.values)) if peak_mode == "min" else int(np.argmax(seg.values))
+        peak_idx = s + peak_idx_local
+
+        # from peak onward, find first time we are in the "recovered" zone for stability consecutive minutes
+        if peak_mode == "min":
+            # for 'min' insults (e.g., CPP low), recovery means values >= recovery_to
+            rec_mask = g >= float(recovery_to)
+        else:
+            # for 'max' insults (e.g., ICP high), recovery means values <= recovery_to
+            rec_mask = g <= float(recovery_to)
+
+        # need stability minutes in a row
+        rec_seq = rec_mask.iloc[peak_idx:]
+        if rec_seq.size >= recovery_stability:
+            # rolling window of stability
+            stable = rec_seq.rolling(window=recovery_stability, min_periods=recovery_stability).apply(lambda x: 1.0 if np.all(x) else 0.0, raw=True)
+            first_ok = stable[stable == 1.0].index.min()
+            if pd.notna(first_ok):
+                # time difference in minutes
+                peak_time = grid_index[peak_idx]
+                rec_time = first_ok
+                rec_minutes = int((rec_time - peak_time) / pd.Timedelta(minutes=1))
+                if rec_minutes >= 0:
+                    rec_times.append(rec_minutes)
+
+    if len(rec_times) > 0:
+        out["recovery_median_mins"] = float(np.median(rec_times))
+        out["recovery_mean_mins"] = float(np.mean(rec_times))
+    else:
+        out["recovery_median_mins"] = np.nan
+        out["recovery_mean_mins"] = np.nan
+
+    return out
+
+# This is a key function that takes all the raw, minute-by-minute ICU monitoring data for a single
+# patient and transforms it into a comprehensive set of summary features. It's the engine that
+# creates the patient's 'dynamic physiological profile' for the model to use. It calculates everything
+# from simple averages (like mean ICP over 24 hours) to highly sophisticated metrics like the 'burden'
+# of high ICP, the 'dose' of low blood pressure, and the detailed 'episode signatures' described above.
+def create_dynamic_features_from_patient_data(
+    patient_icu_df: pd.DataFrame,
+    landmark_h: int,
+    cfg: Dict
+) -> pd.Series:
+    fe_cfg = cfg["FEATURE_ENGINEERING"]
+    all_possible_dyn_vars = [sanitize_name(v) for v in fe_cfg["DYNAMIC_VARS"]]
+    all_features: Dict[str, Any] = {}
+
+    # Missingness flags (exist for all patients)
+    for var in all_possible_dyn_vars:
+        has_data = (patient_icu_df is not None) and (var in patient_icu_df.columns) and (patient_icu_df[var].notna().any())
+        all_features[f'meta_has_{var}'] = int(has_data)
+
+    if patient_icu_df is None or patient_icu_df.empty:
+        return pd.Series(all_features, dtype=float)
+
+    ffill_minutes = int(fe_cfg.get("MAX_FFILL_MINUTES", 15))
+    min_pts = int(fe_cfg.get("MIN_DATA_POINTS_PER_VAR", 5))
+    begin_h = float(fe_cfg.get("BEGIN_WINDOW_HOURS", 24))
+    end_h = float(fe_cfg.get("END_WINDOW_HOURS", 8))
+
+    H = float(landmark_h)
+    begin_h = max(0.0, min(begin_h, H))
+    end_h   = max(0.0, min(end_h,   H))
+    end_start_h = max(0.0, H - end_h)
+
+    dyn_vars_present = [v for v in all_possible_dyn_vars if all_features.get(f'meta_has_{v}', 0) == 1]
+    if not dyn_vars_present:
+        return pd.Series(all_features, dtype=float)
+
+    grid_index = pd.timedelta_range(start="0s", periods=int(landmark_h) * 60, freq="1min")
+    name_map = {v.lower(): v for v in dyn_vars_present}
+
+    # ---------- Summary + windowed features ----------
+    for var in dyn_vars_present:
+        # Raw series (irregular, but Timedelta index)
+        series = pd.to_numeric(patient_icu_df[var], errors='coerce').dropna()
+        if series.size < min_pts:
+            continue
+
+        # Global summary on raw points
+        all_features[f'dyn_{var}_mean'] = float(series.mean())
+        all_features[f'dyn_{var}_std']  = float(series.std(ddof=0))
+        all_features[f'dyn_{var}_q90']  = float(series.quantile(0.90))
+        all_features[f'dyn_{var}_q10']  = float(series.quantile(0.10))
+        all_features[f'dyn_{var}_count'] = int(series.size)
+        if series.size > 1:
+            all_features[f'dyn_{var}_mean_abs_diff'] = float(np.mean(np.abs(np.diff(series.values))))
+        else:
+            all_features[f'dyn_{var}_mean_abs_diff'] = 0.0
+
+        # Align to 1-min grid for time-based stats (time-weighted by construction)
+        g = _grid_align(series, grid_index, ffill_minutes)
+        g_nonan = g.dropna()
+
+        # Time-weighted (minute-averaged) mean across whole window
+        if g_nonan.size:
+            all_features[f'dyn_{var}_time_w_mean']  = float(g_nonan.mean())
+            all_features[f'dyn_{var}_coverage_hrs'] = float(g_nonan.size / 60.0)
+        else:
+            all_features[f'dyn_{var}_coverage_hrs'] = 0.0
+
+        # ---- Begin window: [0, begin_h] ----
+        if begin_h > 0:
+            begin_g = g.loc[:pd.to_timedelta(begin_h, 'h')].dropna()
+            if begin_g.size > 0:
+                all_features[f'dyn_{var}_begin_mean'] = float(begin_g.mean())
+                if begin_g.size > 1:
+                    xh = begin_g.index.total_seconds() / 3600.0
+                    all_features[f'dyn_{var}_begin_slope'] = float(np.polyfit(xh, begin_g.values, 1)[0])
+
+        # ---- End window: [H - end_h, H] ----
+        if end_h > 0:
+            end_g = g.loc[pd.to_timedelta(end_start_h, 'h'):pd.to_timedelta(H, 'h')].dropna()
+            if end_g.size > 0:
+                all_features[f'dyn_{var}_end_mean'] = float(end_g.mean())
+                if end_g.size > 1:
+                    all_features[f'dyn_{var}_end_var']  = float(end_g.var(ddof=0))
+                    xh = end_g.index.total_seconds() / 3600.0
+                    all_features[f'dyn_{var}_end_slope'] = float(np.polyfit(xh, end_g.values, 1)[0])
+
+    # ---------- Event burdens ----------
+    for var_key, conditions in fe_cfg["EVENT_BURDEN_VARS"].items():
+        true_var = name_map.get(var_key.lower())
+        if true_var is None:
+            continue
+        for direction, thresholds in conditions.items():
+            for t in thresholds:
+                min_cov = 6 * 60  # require at least 6h observed
+                val_frac = _single_burden(patient_icu_df[true_var], direction, float(t),
+                                          grid_index, ffill_minutes,
+                                          mode="observed_fraction", min_obs_minutes=min_cov)
+                if pd.notna(val_frac):
+                    all_features[f'evt_{true_var}_frac_{direction}_{t}'] = float(val_frac)
+                val_abs  = _single_burden(patient_icu_df[true_var], direction, float(t),
+                                          grid_index, ffill_minutes,
+                                          mode="absolute_minutes",  min_obs_minutes=min_cov)
+                if pd.notna(val_abs):
+                    all_features[f'evt_{true_var}_abs_mins_{direction}_{t}'] = float(val_abs)
+
+    # ---------- Insult dose (AUC-like) ----------
+    if 'icpm' in name_map:
+        g_icp = _grid_align(patient_icu_df[name_map['icpm']], grid_index, ffill_minutes)
+        if g_icp.notna().any():
+            icp20 = (g_icp - 20).clip(lower=0)
+            icp25 = (g_icp - 25).clip(lower=0)
+            all_features['dose_ICPm_auc_gt_20'] = float(icp20.sum())
+            all_features['dose_ICPm_auc_gt_25'] = float(icp25.sum())
+
+    if 'cpp' in name_map:
+        g_cpp = _grid_align(patient_icu_df[name_map['cpp']], grid_index, ffill_minutes)
+        if g_cpp.notna().any():
+            cpp60 = (60 - g_cpp).clip(lower=0)
+            cpp50 = (50 - g_cpp).clip(lower=0)
+            all_features['dose_CPP_auc_lt_60'] = float(cpp60.sum())
+            all_features['dose_CPP_auc_lt_50'] = float(cpp50.sum())
+
+    # ---------- Event signature features (episodes / clustering / recovery) ----------
+    es_cfg = fe_cfg.get("EVENT_SIGNATURE", {})
+    icp_thr_main = float(es_cfg.get("ICP_GT_MAIN", 25.0))
+    icp_recovery_to = float(es_cfg.get("RECOVERY_TO_ICP", 20.0))          # normalize threshold
+    cpp_low_main = float(es_cfg.get("CPP_LT_MAIN", 50.0))
+    prx_thr_main = float(es_cfg.get("PRX_GT_MAIN", 0.3))
+    min_episode_min = int(es_cfg.get("MIN_EPISODE_MINUTES", 5))           # filter out 1–2 min noise if you wish; we merge via _extract_episode_runs if you set merge_gap>0
+    merge_gap_min = int(es_cfg.get("MERGE_GAP_MINUTES", 0))               # to merge close episodes; 0 keeps them separate
+    recovery_stability = int(es_cfg.get("RECOVERY_STABILITY_MIN", 5))     # require 5 straight minutes "recovered"
+
+    # Align streams we need
+    g_icp = None
+    g_cpp = None
+    g_prx = None
+    if 'icpm' in name_map:
+        g_icp = _grid_align(patient_icu_df[name_map['icpm']], grid_index, ffill_minutes)
+    if 'cpp' in name_map:
+        g_cpp = _grid_align(patient_icu_df[name_map['cpp']],  grid_index, ffill_minutes)
+    if 'prx' in name_map:
+        g_prx = _grid_align(patient_icu_df[name_map['prx']],  grid_index, ffill_minutes)
+
+    # -------------------- ICP > 25 mmHg episodes --------------------
+    if g_icp is not None and g_icp.notna().any():
+        icp_mask = (g_icp > icp_thr_main)
+        # (Optionally enforce min duration and merging inside metrics by reusing mask post-processed)
+        # We'll post-process runs for min length & merge; do it by replacing mask with runs.
+        base_runs = _extract_episode_runs(icp_mask, min_len=max(1, min_episode_min), merge_gap=merge_gap_min)
+        # Build a mask that marks only kept runs
+        if base_runs:
+            keep = pd.Series(False, index=icp_mask.index)
+            for s, e in base_runs:
+                keep.iloc[s:e+1] = True
+            icp_mask = keep
+
+        icp_epi = _episode_metrics_from_mask(g_icp, icp_mask, grid_index,
+                                             peak_mode="max",
+                                             recovery_to=icp_recovery_to,
+                                             recovery_stability=recovery_stability)
+        # Prefix and export
+        for k, v in icp_epi.items():
+            all_features[f'evt_ICPm_gt{int(icp_thr_main)}_{k}'] = float(v) if pd.notna(v) else (0.0 if k in {"n_episodes","tot_mins"} else np.nan)
+
+        # Optional: intensity–duration grid for ICP peaks during episodes
+        # Recompute peaks & durations for bins
+        runs = _extract_episode_runs(icp_mask, min_len=1, merge_gap=0)
+        if runs:
+            durs = [(e - s + 1) for s, e in runs]
+            peaks = [float(g_icp.iloc[s:e+1].max()) for s, e in runs]
+            # Coarse bins you can tune in cfg:
+            peak_bins = es_cfg.get("ICP_PEAK_BINS", [25.0, 30.0, 40.0])      # => (<25], 25–30], 30–40], >40
+            dur_bins  = es_cfg.get("DURATION_BINS_MIN", [5, 15, 60])         # => (<5], 5–15], 15–60], >60
+            grid_counts = _episode_grid_counts(peaks, durs, list(map(float, peak_bins)), list(map(int, dur_bins)))
+            for k, v in grid_counts.items():
+                all_features[f'evtgrid_ICPm_gt{int(icp_thr_main)}_{k}'] = int(v)
+
+    # -------------------- Double hit: ICP>25 & CPP<50 --------------------
+    if (g_icp is not None) and (g_cpp is not None) and (g_icp.notna().any()) and (g_cpp.notna().any()):
+        dh_mask = (g_icp > icp_thr_main) & (g_cpp < cpp_low_main) & g_icp.notna() & g_cpp.notna()
+        dh_runs = _extract_episode_runs(dh_mask, min_len=max(1, min_episode_min), merge_gap=merge_gap_min)
+        if dh_runs:
+            keep = pd.Series(False, index=dh_mask.index)
+            for s, e in dh_runs:
+                keep.iloc[s:e+1] = True
+            dh_mask = keep
+
+        # Use ICP series for peaks; for double hits peak severity could be characterized by ICP peak
+        dh_epi = _episode_metrics_from_mask(g_icp, dh_mask, grid_index,
+                                            peak_mode="max",
+                                            recovery_to=icp_recovery_to,
+                                            recovery_stability=recovery_stability)
+        for k, v in dh_epi.items():
+            all_features[f'evt_doublehit_icp{int(icp_thr_main)}_cpp{int(cpp_low_main)}_{k}'] = float(v) if pd.notna(v) else (0.0 if k in {"n_episodes","tot_mins"} else np.nan)
+
+    # -------------------- Triple hit: ICP>25 & CPP<50 & PRx>0.3 --------------------
+    if (g_icp is not None) and (g_cpp is not None) and (g_prx is not None) and \
+       g_icp.notna().any() and g_cpp.notna().any() and g_prx.notna().any():
+        th_mask = (g_icp > icp_thr_main) & (g_cpp < cpp_low_main) & (g_prx > prx_thr_main)
+        th_mask = th_mask & g_icp.notna() & g_cpp.notna() & g_prx.notna()
+
+        th_runs = _extract_episode_runs(th_mask, min_len=max(1, min_episode_min), merge_gap=merge_gap_min)
+        if th_runs:
+            keep = pd.Series(False, index=th_mask.index)
+            for s, e in th_runs:
+                keep.iloc[s:e+1] = True
+            th_mask = keep
+
+        th_epi = _episode_metrics_from_mask(g_icp, th_mask, grid_index,
+                                            peak_mode="max",
+                                            recovery_to=icp_recovery_to,
+                                            recovery_stability=recovery_stability)
+        for k, v in th_epi.items():
+            all_features[f'evt_triplehit_icp{int(icp_thr_main)}_cpp{int(cpp_low_main)}_prx{str(prx_thr_main).replace(".","")}_{k}'] = float(v) if pd.notna(v) else (0.0 if k in {"n_episodes","tot_mins"} else np.nan)
+    
+    # ---------- Optional joint burdens if PRx exists ----------
+    prx_col = name_map.get('prx')
+    if prx_col:
+        combos = [
+            (('ICPm', 'above', 20), (prx_col, 'above', 0.0), 'red_icp20_prx0'),
+            (('CPP',  'below', 70), (prx_col, 'above', 0.2), 'red_cpp70_prx02'),
+        ]
+        for (v1_name, dir1, t1), (v2_name, dir2, t2), out_name in combos:
+            v1_col = name_map.get(v1_name.lower())
+            v2_col = prx_col
+            if v1_col and v1_col in patient_icu_df.columns and v2_col in patient_icu_df.columns:
+                min_obs = 6 * 60
+                val_frac = _joint_burden(patient_icu_df[v1_col], dir1, t1,
+                                         patient_icu_df[v2_col], dir2, t2,
+                                         grid_index, ffill_minutes,
+                                         mode="observed_fraction", min_obs_minutes=min_obs)
+                if pd.notna(val_frac):
+                    all_features[f'evt_{out_name}_frac'] = float(val_frac)
+                val_abs  = _joint_burden(patient_icu_df[v1_col], dir1, t1,
+                                         patient_icu_df[v2_col], dir2, t2,
+                                         grid_index, ffill_minutes,
+                                         mode="absolute_minutes",  min_obs_minutes=min_obs)
+                if pd.notna(val_abs):
+                    all_features[f'evt_{out_name}_abs_mins'] = float(val_abs)
+
+    return pd.Series(all_features)
+
+# This is a statistical helper that measures the 'burstiness' of events. Given the time gaps
+# between episodes (e.g., high ICP spikes), it calculates a score that tells us if the episodes
+# are occurring randomly and periodically, or if they tend to happen in tight clusters or 'bursts'.
+def _burstiness_from_intervals(intervals: List[int]) -> float:
+    """
+    Burstiness B = (sigma - mu) / (sigma + mu); returns np.nan if not defined.
+    """
+    if intervals is None or len(intervals) < 2:
+        return np.nan
+    arr = np.asarray(intervals, dtype=float)
+    mu = arr.mean()
+    sd = arr.std(ddof=1) if arr.size > 1 else 0.0
+    if (sd + mu) == 0:
+        return np.nan
+    return float((sd - mu) / (sd + mu))
+
+# This function manages the entire process of creating dynamic features for all patients in the study.
+# It iterates through each patient one by one, finds their corresponding ICU data files, loads and
+# cleans the data, aligns it to their time of injury, and then calls the main feature creation function
+# (above) to generate their physiological profile. It then collects all these individual patient profiles
+# into a single, master data table that is ready for model training.
+def generate_dynamic_features_for_landmark(master_df_landmark: pd.DataFrame, icu_folder_path: str, landmark_h: int, cfg: Dict) -> pd.DataFrame:
+    logging.info(f"--- 2. Generating Dynamic Features for Landmark {landmark_h}h ---")
+    patient_feature_rows, patient_stats = {}, {}
+    pids_to_process = master_df_landmark.index
+    fe_cfg = cfg["FEATURE_ENGINEERING"]
+    s_id, s_trauma_dt = sanitize_name(COL_ID), sanitize_name(COL_TRAUMA_DATETIME)
+
+    for pid in tqdm(pids_to_process, desc=f"  Processing patients for {landmark_h}h", unit="patient", leave=False):
+        icu_paths = sorted(glob(os.path.join(icu_folder_path, f"{pid}*.csv")))
+        if not icu_paths:
+            patient_stats[pid] = 'no_icu_file'
+            continue
+        try:
+            icu_dfs = [read_icu_table(p) for p in icu_paths]
+            df_pat = pd.concat([df for df in icu_dfs if df is not None and not df.empty], ignore_index=True)
+            if df_pat.empty:
+                patient_stats[pid] = 'empty_icu_file'
+                continue
+
+            df_pat.columns = [sanitize_name(c) for c in df_pat.columns]
+            df_pat = ensure_icu_timestamp(df_pat)
+            s_icu_time = sanitize_name(COL_ICU_TIME)
+            if s_icu_time not in df_pat.columns or df_pat[s_icu_time].isna().all():
+                patient_stats[pid] = 'no_timestamps'
+                continue
+
+            trauma_dt = master_df_landmark.loc[pid, s_trauma_dt]
+            if pd.isna(trauma_dt):
+                patient_stats[pid] = 'no_trauma_datetime'
+                continue
+            df_pat[COL_TIME_AFTER_TRAUMA] = df_pat[s_icu_time] - trauma_dt
+            df_pat = df_pat.copy()
+
+            # Cut to [0, H]
+            df_pat_h = df_pat[(df_pat[COL_TIME_AFTER_TRAUMA] >= pd.Timedelta(0)) & (df_pat[COL_TIME_AFTER_TRAUMA] <= pd.to_timedelta(landmark_h, 'h'))].copy()
+            df_pat_h = df_pat_h.set_index(COL_TIME_AFTER_TRAUMA).sort_index()
+            if df_pat_h.empty:
+                patient_stats[pid] = 'no_data_in_window'
+                continue
+            # Clean implausible values
+            df_pat_h = filter_plausible_icu_values(df_pat_h, fe_cfg["PLAUSIBLE_RANGES"])
+
+            # Identify dynamic variables we actually have
+            dyn_vars = [sanitize_name(v) for v in fe_cfg["DYNAMIC_VARS"] if sanitize_name(v) in df_pat_h.columns]
+            if not dyn_vars:
+                patient_stats[pid] = 'no_dynamic_vars'
+                continue
+            
+            # df_pat_h = local_forward_fill(df_pat_h, COL_TIME_AFTER_TRAUMA, dyn_vars, fe_cfg["MAX_FFILL_MINUTES"]) <- reduntant
+        
+            if df_pat_h[dyn_vars].notna().sum().sum() > 0:
+                patient_features = create_dynamic_features_from_patient_data(df_pat_h, landmark_h, cfg)
+                if not patient_features.empty:
+                    patient_feature_rows[pid] = patient_features
+                    patient_stats[pid] = 'success'
+                else: patient_stats[pid] = 'not_enough_clean_data'
+            else: patient_stats[pid] = 'no_valid_data_after_clean'
+        except Exception as e:
+            logging.warning(f"Failed to process ICU data for patient {pid}: {e}", exc_info=False)
+            patient_stats[pid] = 'processing_error'
+
+    stats_counts = pd.Series(patient_stats).value_counts()
+    logging.info(f"ICU processing stats for {landmark_h}h landmark: \n{stats_counts.to_string()}")
+
+    try:
+        audit_path = os.path.join(cfg["RUN_INFO"]["OUTPUT_FOLDER"], f"icu_processing_stats_{landmark_h}h.csv")
+        pd.Series(patient_stats, name='status').to_csv(audit_path, header=True)
+    except Exception as e:
+        logging.warning(f"Could not save ICU processing stats for {landmark_h}h: {e}")
+
+    if not patient_feature_rows:
+        logging.warning(f"No dynamic features could be generated for the {landmark_h}h landmark.")
+        return pd.DataFrame()
+
+    dynamic_features_df = pd.DataFrame.from_dict(patient_feature_rows, orient='index')
+    dynamic_features_df.index.name = s_id
+    logging.info(f"Successfully generated dynamic features for {len(dynamic_features_df)} patients at {landmark_h}h.")
+    return dynamic_features_df
+
+# After generating hundreds of new features from the ICU data, this function intelligently selects
+# the most important ones to use in our final predictive model. It works by training a quick
+# 'pre-screening' model to rank all the new ICU features based on their predictive power. It then
+# picks the best-performing 'Top N' features and combines them with the essential baseline patient
+# information (like age, sex, and initial GCS). This helps prevent the model from being overwhelmed
+# by too much information and focuses it on the variables that matter most.
+def select_features_for_icu_model(
+    X_baseline: pd.DataFrame,
+    X_icu: pd.DataFrame,
+    y: pd.Series,
+    cfg: Dict
+) -> list:
+    """
+    Rank ICU features using a fast XGB trained on ICU-only columns (original names),
+    then return ALL baseline features + top-N ICU columns.
+    """
+    fs_cfg = cfg["FEATURE_SELECTION"]
+    top_n_icu = int(fs_cfg["TOP_N_ICU_FEATURES"])
+
+    if X_icu.empty:
+        logging.warning("ICU feature matrix is empty; selecting baseline only.")
+        return X_baseline.columns.tolist()
+
+    # Keep numeric ICU columns and enforce a coverage gate
+    X_icu_num = X_icu.select_dtypes(include=np.number)
+    if X_icu_num.shape[1] == 0:
+        logging.warning("No numeric ICU features; selecting baseline only.")
+        return X_baseline.columns.tolist()
+
+    coverage = X_icu_num.notna().mean(axis=0)
+    keep_cols = coverage[coverage >= 0.50].index.tolist()
+    if not keep_cols:
+        logging.warning("No ICU features pass coverage >=50%; falling back to baseline only.")
+        return X_baseline.columns.tolist()
+    if len(keep_cols) < X_icu_num.shape[1]:
+        logging.info(f"Coverage filter kept {len(keep_cols)}/{X_icu_num.shape[1]} ICU features (>=50% non-NaN).")
+    X_icu_num = X_icu_num[keep_cols]
+
+    # Align target, drop NaNs in y, and sync X rows to y
+    y_aligned = y.loc[X_icu_num.index].dropna().astype(int)
+    X_icu_num = X_icu_num.loc[y_aligned.index]
+
+    if X_icu_num.shape[1] == 0 or X_icu_num.shape[0] == 0:
+        logging.warning("ICU selection: no usable rows/columns after alignment; selecting baseline only.")
+        return X_baseline.columns.tolist()
+
+    # Simple imputation; trees don’t need scaling
+    num_feats = X_icu_num.columns.tolist()
+    pre = ColumnTransformer(
+        transformers=[('num', SimpleImputer(strategy='constant', fill_value=np.nan), num_feats)],
+        remainder='drop',
+        verbose_feature_names_out=False
+    )
+
+    selector = xgb.XGBClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.1,
+        random_state=cfg["MODELING"]["RANDOM_STATE"],
+        n_jobs=cfg["MODELING"]["N_JOBS"],
+        tree_method='hist'
+        # You can also set importance_type='total_gain' for stability in some setups.
+    )
+
+    pipe = Pipeline([('preprocessor', pre), ('selector', selector)])
+    pipe.fit(X_icu_num, y_aligned)
+    logging.info(f"Selector debug: X_icu_num.shape={X_icu_num.shape}, "
+             f"importances={pipe.named_steps['selector'].feature_importances_.shape}")
+
+    importances = pipe.named_steps['selector'].feature_importances_
+
+    # Use the exact columns that were fed to the selector (stable across sklearn versions)
+    feat_names = list(X_icu_num.columns)
+
+    # Safety guard in case something ever changes upstream
+    if len(feat_names) != len(importances):
+        logging.warning(
+            f"Selector names/importances length mismatch "
+            f"(names={len(feat_names)}, importances={len(importances)}). "
+            f"Falling back to positional names."
+        )
+        feat_names = [f'col_{i}' for i in range(len(importances))]
+
+    imp = (
+        pd.DataFrame({'feature': feat_names, 'importance': importances})
+        .sort_values('importance', ascending=False)
+    )
+
+    top_icu_cols = [f for f in imp['feature'].tolist() if f in X_icu_num.columns][:top_n_icu]
+    logging.info(f"Selected {len(top_icu_cols)} ICU features (top {top_n_icu}): {top_icu_cols[:5]}...")
+    return X_baseline.columns.tolist() + top_icu_cols
+
+# ============================== MODELING & EVALUATION ====================================
+# This function is a crucial data preparation step that gets the data ready for the machine learning model.
+# It handles numeric and categorical variables differently to ensure they are in a format the model can understand.
+def get_preprocessor(numeric_feats, cat_feats, for_tree=False):
+    ver = tuple(int(x) for x in sklearn.__version__.split('.')[:2])
+    ohe_kwargs = {'handle_unknown': 'ignore'}
+    if ver >= (1, 2):
+        ohe_kwargs['sparse_output'] = False
+    else:
+        ohe_kwargs['sparse'] = False
+    if ver >= (1, 1):
+        ohe_kwargs['min_frequency'] = 0.03
+        
+    if for_tree:
+        numeric_pipe = SimpleImputer(strategy='constant', fill_value=-999, add_indicator=True)
+    else:
+        numeric_pipe = Pipeline([
+            ('imputer', SimpleImputer(strategy='median', add_indicator=True)),
+            ('scaler', StandardScaler())
+        ])
+
+
+    cat_pipe = Pipeline([
+        ('imputer', SimpleImputer(strategy='constant', fill_value='__MISSING__')),
+        ('ohe', OneHotEncoder(**ohe_kwargs))
+    ])
+
+    preprocessor = ColumnTransformer(
+        [('num', numeric_pipe, numeric_feats), ('cat', cat_pipe, cat_feats)],
+        remainder='drop', verbose_feature_names_out=False
+    )
+    return preprocessor
+
+# This function trains and optimizes a machine learning model. Think of it like tuning a microscope to get the
+# clearest possible image. The function uses an automated process to test many different settings for the model
+# to find the combination that gives the best performance.
+def fit_and_tune_model(X_train: pd.DataFrame, y_train: pd.Series, model_name: str, cfg: Dict) -> Tuple[BaseEstimator, float]:
+    logging.info(f"  Tuning model: {model_name}")
+    X_train = X_train.dropna(axis=1, how='all')
+    num_feats, cat_feats = X_train.select_dtypes(include=np.number).columns.tolist(), X_train.select_dtypes(exclude=np.number).columns.tolist()
+    pre = get_preprocessor(num_feats, cat_feats, for_tree=(model_name == MODEL_XGB))
+
+    if model_name == MODEL_XGB:
+        clf = xgb.XGBClassifier(random_state=cfg["MODELING"]["RANDOM_STATE"], eval_metric='mlogloss',
+                                objective='multi:softprob', tree_method='hist')
+        pipe = Pipeline([('preprocessor', pre), ('classifier', clf)])
+        y_fit = y_train.dropna().astype(int)
+        X_train_fit = X_train.loc[y_fit.index]
+
+        vc = y_fit.value_counts()
+        logging.info("  [XGBoost] Using compute_sample_weight with 'balanced' strategy.")
+        cls_w = compute_sample_weight(
+            class_weight='balanced',
+            y=y_fit
+        )
+        fit_params = {'classifier__sample_weight': cls_w}
+
+    elif model_name == MODEL_ORDINAL and MORD_AVAILABLE:
+        y_fit = y_train.dropna().astype(int) + 1
+        X_train_fit = X_train.loc[y_fit.index]
+        pipe = Pipeline([('preprocessor', pre), ('classifier', mord.LogisticAT(alpha=1.0))])
+        fit_params = {}
+
+    else:
+        return None, -1
+
+    cv = TimeSeriesSplit(
+        n_splits=cfg["MODELING"]["CV_SPLITS"]
+    )
+
+    search = RandomizedSearchCV(
+        pipe, cfg["MODELING"]["PARAM_GRIDS"][model_name], n_iter=cfg["MODELING"]["HYPERPARAM_N_ITER"],
+        # For StratifiedKFold, the `groups` parameter is not used.
+        # The `fit` method of RandomizedSearchCV will automatically handle passing the data.
+        cv=cv,
+        scoring=make_scorer(cohen_kappa_score, weights='quadratic'),
+        n_jobs=cfg["MODELING"]["N_JOBS"], random_state=cfg["MODELING"]["RANDOM_STATE"],
+        refit=True, error_score=0.0
+    )
+
+    # Always fit on the aligned matrix:
+    X_to_fit = X_train_fit
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.impute")
+        search.fit(X_to_fit, y_fit, **fit_params)
+
+    # ==================== START DIAGNOSTIC BLOCK ====================
+    if model_name == MODEL_XGB:
+        cv_results = pd.DataFrame(search.cv_results_)
+        logging.info(f"[DIAGNOSTIC - XGBoost] CV Results (showing mean_test_score):\n{cv_results[['param_classifier__n_estimators', 'param_classifier__learning_rate', 'mean_test_score', 'std_test_score']]}")
+    # ===================== END DIAGNOSTIC BLOCK =====================
+
+    return search.best_estimator_, search.best_score_
+
+# This is the final and most important step, where we assess how well the fully trained model performs on a
+# set of patients it has never seen before (the test set). It calculates all the key performance metrics
+# and generates the figures and tables you would typically see in a clinical research paper.
+def evaluate_and_save_artifacts(final_pipeline, X_test, y_test, model_info, X_train, cfg):
+    """
+    Evaluates a trained pipeline on test data and saves all relevant artifacts.
+
+    This function performs the following steps:
+    1.  Creates a unique directory for the model's artifacts.
+    2.  Calculates and logs the primary ordinal metric (Quadratic Weighted Kappa) with bootstrapped CIs.
+    3.  If the model supports it, calculates binary metrics (AUROC) for mortality and favorable outcome.
+    4.  Generates and saves a calibration plot for probabilistic predictions.
+    5.  Generates and saves a normalized confusion matrix.
+    6.  If available, performs and saves SHAP analysis for feature importance (for tree models).
+    7.  Exports the list of features used for training.
+    """
+    folder = cfg["RUN_INFO"]["OUTPUT_FOLDER"]
+    # FIX: Modified folder naming to include the comparison group for clarity.
+    # The 'comparison_group' key is added in the new main() function.
+    model_folder = os.path.join(folder, f"{model_info['h']}h_{model_info['comparison_group']}_{model_info['fs_name']}_{model_info['model_name']}")
+    os.makedirs(model_folder, exist_ok=True)
+    
+    # FIX: Updated logging to be more descriptive about the exact model being evaluated.
+    logging.info(f"\n{'='*20} FINAL TEST EVALUATION FOR: {model_info['model_name']} ({model_info['fs_name']} @ {model_info['h']}h on '{model_info['comparison_group']}' cohort) {'='*20}");
+
+    # --- Prepare Data for Evaluation ---
+    valid_outcome_mask = y_test[COL_TARGET_ORDINAL_0_6].notna()
+    X_test_eval = X_test.loc[valid_outcome_mask]
+    y_test_eval = y_test.loc[valid_outcome_mask]
+
+    if X_test_eval.empty:
+        logging.warning("No test samples with valid outcomes. Skipping evaluation.")
+        return
+
+    # --- Ordinal Prediction & Core Metric (QWK) ---
+    y_pred_ordinal = final_pipeline.predict(X_test_eval)
+    y_true_ordinal = y_test_eval[COL_TARGET_ORDINAL_0_6].values
+
+    # ==================== START DIAGNOSTIC BLOCK ====================
+    if model_info['model_name'] == MODEL_XGB:
+        logging.info(f"[DIAGNOSTIC - XGBoost] Raw predictions: {y_pred_ordinal}")
+        logging.info(f"[DIAGNOSTIC - XGBoost] Unique predictions and counts: {pd.Series(y_pred_ordinal).value_counts().to_dict()}")
+        logging.info(f"[DIAGNOSTIC - XGBoost] Unique TRUE labels and counts: {pd.Series(y_true_ordinal).value_counts().to_dict()}")
+# ===================== END DIAGNOSTIC BLOCK =====================
+
+    classifier_step = final_pipeline.named_steps['classifier']
+    if MORD_AVAILABLE and isinstance(classifier_step, (mord.LogisticAT, getattr(mord, 'LogisticIT', tuple()))):
+        y_pred_ordinal = y_pred_ordinal - 1
+        logging.info("  (mord model detected, shifting predictions from 1-7 to 0-6 for evaluation)")
+
+    qwk, qwk_low, qwk_high = bootstrap_metric(y_true_ordinal, y_pred_ordinal, cohen_kappa_score, weights='quadratic', random_state=cfg["MODELING"]["RANDOM_STATE"])
+    logging.info(f"==> Final Test QWK: {qwk:.3f} (95% CI: {qwk_low:.3f} - {qwk_high:.3f})")
+
+    # --- Probabilistic Metrics (AUROC, Calibration) ---
+    classifier = final_pipeline.named_steps['classifier']
+    if hasattr(classifier, "predict_proba"):
+            # Initialize so we can safely test readiness later
+        y_true_dead_or_vs = None
+        y_prob_dead_or_vs = None
+        y_true_favorable = None
+        y_prob_favorable = None
+
+        try:
+            y_pred_proba_all = final_pipeline.predict_proba(X_test_eval)
+            classifier = final_pipeline.named_steps['classifier']
+
+            # Classes reported by the classifier (e.g., mord gives 1..7)
+            classes = getattr(classifier, "classes_", np.arange(y_pred_proba_all.shape[1]))
+
+            # Align mord’s 1..7 to our 0..6 label space, without changing column order
+            if np.issubdtype(classes.dtype, np.integer) and classes.min() == 1:
+                classes = classes - 1
+
+            # Map class label -> column index (uses the possibly-shifted labels above)
+            cls_to_idx = {int(c): i for i, c in enumerate(classes)}
+
+            # ---- Death/VS AUROC (ordinal class 0 = {death, VS}) ----
+            dead_or_vs_idx = cls_to_idx.get(0)
+            if dead_or_vs_idx is not None:
+                y_prob_dead_or_vs = y_pred_proba_all[:, dead_or_vs_idx]
+                y_true_dead_or_vs = (y_test_eval[COL_TARGET_GOSE_1_8].isin([1, 2])).astype(int).values
+                auroc_dv, lo, hi = bootstrap_metric(
+                    y_true_dead_or_vs, y_prob_dead_or_vs, roc_auc_score,
+                    random_state=cfg["MODELING"]["RANDOM_STATE"]
+                )
+                logging.info(f"==> Death/VS AUROC: {auroc_dv:.3f} (95% CI: {lo:.3f} - {hi:.3f})")
+            else:
+                logging.warning("Death/VS class (ordinal 0) not found in model classes. Skipping Death/VS AUROC.")
+
+            # Favorable Outcome Evaluation
+            # Favorable is GOSE_1_8 >= 5, which maps to GOSE_Ordinal_0_6 >= 3
+            favorable_indices = [cls_to_idx.get(c) for c in classes if c >= 3 and cls_to_idx.get(c) is not None]
+            if favorable_indices:
+                y_prob_favorable = y_pred_proba_all[:, favorable_indices].sum(axis=1)
+                y_true_favorable = y_test_eval[COL_TARGET_FAVORABLE].values
+                auroc_f, auroc_f_low, auroc_f_high = bootstrap_metric(y_true_favorable, y_prob_favorable, roc_auc_score, random_state=cfg["MODELING"]["RANDOM_STATE"])
+                logging.info(f"==> {COL_TARGET_FAVORABLE} AUROC: {auroc_f:.3f} (95% CI: {auroc_f_low:.3f} - {auroc_f_high:.3f})")
+            else:
+                logging.warning("No favorable outcome classes (>=3) found. Skipping AUROC.")
+                y_true_favorable, y_prob_favorable = None, None # Ensure variables don't exist
+
+            # Calibration Plots
+            mortality_ready = (y_true_dead_or_vs is not None) and (y_prob_dead_or_vs is not None)
+            favorable_ready = (y_true_favorable is not None) and (y_prob_favorable is not None)
+
+            if mortality_ready or favorable_ready:
+                cols = 1 if (mortality_ready ^ favorable_ready) else 2
+                fig, axes = plt.subplots(1, cols, figsize=(6*cols, 5), squeeze=False)
+                axes = axes.flatten()
+
+                idx = 0
+                if mortality_ready:
+                    CalibrationDisplay.from_predictions(y_true_dead_or_vs, y_prob_dead_or_vs, n_bins=10, ax=axes[idx], name="Mortality/VS", strategy='uniform')
+                    axes[idx].set_title("Calibration - Mortality/VS"); idx += 1
+                if favorable_ready:
+                    CalibrationDisplay.from_predictions(y_true_favorable, y_prob_favorable, n_bins=10, ax=axes[idx], name="Favorable", strategy='uniform')
+                    axes[idx].set_title("Calibration - Favorable")
+
+                fig.suptitle(f"Calibration Plots\n{model_info['model_name']} | {model_info['fs_name']} @ {model_info['h']}h", fontsize=14)
+                plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                plt.savefig(os.path.join(model_folder, "final_calibration_plots.png"))
+                plt.close(fig)
+
+                if mortality_ready or favorable_ready:
+                    fig, ax = plt.subplots(figsize=(8, 8))
+                
+                if mortality_ready:
+                    RocCurveDisplay.from_predictions(
+                        y_true_dead_or_vs, y_prob_dead_or_vs,
+                        name=f"Mortality/VS (AUC = {auroc_dv:.3f})", ax=ax
+                    )
+                if favorable_ready:
+                    RocCurveDisplay.from_predictions(
+                        y_true_favorable, y_prob_favorable,
+                        name=f"Favorable Outcome (AUC = {auroc_f:.3f})", ax=ax
+                    )
+                    
+                ax.plot([0, 1], [0, 1], "k--", label="Chance")
+                ax.set_title(f"ROC Curves (Test Set)\n{model_info['model_name']} | {model_info['fs_name']} @ {model_info['h']}h")
+                ax.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(model_folder, "final_roc_curves.png"))
+                plt.close(fig)
+
+        except Exception as e:
+            logging.warning(f"Could not calculate binary metrics or plots from model probabilities: {e}", exc_info=True) # Modified log
+    else:
+        logging.info(f"Model {model_info['model_name']} does not support predict_proba. Skipping binary metrics.")
+
+    # --- Confusion Matrix ---
+    fig, ax = plt.subplots(figsize=(10, 8))
+    labels_sorted = sorted(np.unique(np.concatenate((y_true_ordinal, y_pred_ordinal))))
+    display_labels = [cfg["ARTIFACTS"]["GOSE_ORDINAL_LABELS"].get(k, str(k)) for k in labels_sorted]
+    ConfusionMatrixDisplay.from_predictions(y_true_ordinal, y_pred_ordinal, labels=labels_sorted, display_labels=display_labels, cmap=plt.cm.Blues, normalize='true', ax=ax, xticks_rotation='vertical')
+    ax.set_title(f"Normalized Confusion Matrix (Test Set)\n{model_info['model_name']} | {model_info['fs_name']} @ {model_info['h']}h\nQWK = {qwk:.3f}");
+    plt.tight_layout(); plt.savefig(os.path.join(model_folder, "final_confusion_matrix.png")); plt.close(fig)
+
+    # --- SHAP Analysis (for XGBoost) ---
+    if SHAP_AVAILABLE and model_info['model_name'] == MODEL_XGB:
+        logging.info("  Generating SHAP analysis (class-specific + probability-weighted)...")
+        try:
+            preprocessor = final_pipeline.named_steps['preprocessor']
+            classifier = final_pipeline.named_steps['classifier']
+
+            X_test_transformed = preprocessor.transform(X_test_eval)
+            try:
+                feature_names = preprocessor.get_feature_names_out()
+            except Exception:
+                feature_names = [f"f{i}" for i in range(X_test_transformed.shape[1])]
+
+            X_test_transformed_df = pd.DataFrame(X_test_transformed, columns=feature_names, index=X_test_eval.index)
+
+
+            if len(X_test_transformed_df) == 0:
+                logging.info("  No test rows available for SHAP; skipping.")
+            else:
+                # Sample for speed
+                sample_size = min(len(X_test_transformed_df), cfg["ARTIFACTS"]["SHAP_SAMPLE_SIZE"])
+                X_test_sample = X_test_transformed_df.sample(sample_size, random_state=cfg["MODELING"]["RANDOM_STATE"])
+
+                # Predict probabilities on the same transformed rows (for weighting)
+                try:
+                    probs_sample = classifier.predict_proba(X_test_sample)  # shape: (n, C)
+                except Exception as e:
+                    logging.warning(f"  predict_proba failed on transformed sample; trying raw pipeline: {e}")
+                    # Fallback: use pipeline (slower) but should not happen since we already transformed above
+                    probs_sample = final_pipeline.predict_proba(X_test_eval.loc[X_test_sample.index])
+
+                # Build explainer & compute SHAP values
+                explainer = shap.TreeExplainer(classifier)
+                try:
+                    sv_obj = explainer(X_test_sample)
+                    # Standardize into a list of per-class 2D arrays (n_samples, n_features)
+                    if hasattr(sv_obj, "values"):
+                        vals = sv_obj.values
+                        # vals can be (n, n_features, n_classes) or (n, n_features)
+                        if hasattr(vals, "ndim") and vals.ndim == 3:
+                            shap_list = [vals[:, :, k] for k in range(vals.shape[2])]
+                        else:
+                            shap_list = [vals]
+                    else:
+                        # Some SHAP versions return a list already
+                        shap_list = sv_obj if isinstance(sv_obj, list) else [sv_obj]
+                except TypeError:
+                    # Older SHAP API
+                    sv = explainer.shap_values(X_test_sample)
+                    shap_list = sv if isinstance(sv, list) else [sv]
+
+                # Safety: align class counts if possible
+                try:
+                    n_classes = probs_sample.shape[1]
+                except Exception:
+                    n_classes = len(shap_list)
+                if len(shap_list) != n_classes:
+                    logging.warning(f"  SHAP class count mismatch (shap={len(shap_list)}, proba={n_classes}). Proceeding with available outputs.")
+
+                # Helper for plotting a pair of SHAP plots safely
+                def _safe_summary_plot(values_2d, suffix):
+                    try:
+                        plt.figure(figsize=(10, 15))
+                        shap.summary_plot(values_2d, X_test_sample, plot_type="bar", show=False, max_display=40)
+                        plt.title(f"SHAP Feature Importance ({suffix})\n{model_info['model_name']} | {model_info['fs_name']} @ {model_info['h']}h")
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(model_folder, f'shap_summary_bar_{suffix}.png'))
+                        plt.close()
+
+                        plt.figure(figsize=(10, 15))
+                        shap.summary_plot(values_2d, X_test_sample, show=False, max_display=40)
+                        plt.title(f"SHAP Feature Impact ({suffix})\n{model_info['model_name']} | {model_info['fs_name']} @ {model_info['h']}h")
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(model_folder, f'shap_summary_beeswarm_{suffix}.png'))
+                        plt.close()
+                    except Exception as e:
+                        logging.warning(f"  SHAP plotting failed for '{suffix}': {e}", exc_info=True)
+
+                # ---- (A) Class-specific plots ----
+                # Ordinal mapping: class 0 = Death/VS; Favorable ~ classes >= 3. Use class 3 as representative.
+                death_vs_ix = 0 if len(shap_list) > 0 else None
+                favorable_rep_ix = 3 if len(shap_list) > 3 else (len(shap_list)-1 if len(shap_list) else None)
+
+                if death_vs_ix is not None:
+                    _safe_summary_plot(shap_list[death_vs_ix], 'death_vs_class0')
+
+                if favorable_rep_ix is not None:
+                    _safe_summary_plot(shap_list[favorable_rep_ix], f'favor_class{favorable_rep_ix}')
+
+                # ---- (B) Probability-weighted summary across classes ----
+                try:
+                    # Weight each class's SHAP by its predicted probability for that sample
+                    C = min(len(shap_list), probs_sample.shape[1]) if hasattr(probs_sample, "shape") else len(shap_list)
+                    sv_weighted = np.zeros_like(shap_list[0], dtype=float)
+                    for k in range(C):
+                        sv_k = shap_list[k]
+                        w = probs_sample[:, [k]]  # (n, 1)
+                        sv_weighted += w * sv_k
+
+                    _safe_summary_plot(sv_weighted, 'prob_weighted')
+                except Exception as e:
+                    logging.warning(f"  Probability-weighted SHAP failed: {e}", exc_info=True)
+
+                logging.info("  SHAP analysis complete.")
+
+        except Exception as e:
+            logging.warning(f"  SHAP generation failed: {e}", exc_info=True)
+
+    # --- Export Feature List ---
+    try:
+        pd.DataFrame({'feature_name': X_train.columns}).to_csv(
+                os.path.join(model_folder, "train_features.csv"),
+                index=False
+            )
+        logging.info(f"  Exported {len(X_train.columns)} feature names to train_features.csv")
+    except Exception as e:
+        logging.warning(f"Could not export feature list: {e}")
+
+
+# ============================== MAIN EXECUTION ================================
+"""
+    This is the main conductor of the entire analysis pipeline. It orchestrates all the steps from
+    loading the data to generating the final summary tables, ensuring a rigorous and reproducible workflow.
+
+    The key steps it performs are:
+    1. Loads the master patient database and splits it into a training set (older data) and a test set (newer data).
+    2. Repeats the entire modeling process at different time points after injury (e.g., 24h, 48h), which we call 'landmarks'.
+    3. For each landmark, it correctly identifies the group of patients who were still alive and at risk.
+    4. It then generates all the necessary predictor variables, from simple baseline data to the complex dynamic features from ICU monitoring.
+    5. It defines two important patient groups for comparison:
+        a) all_at_risk: All patients alive at the landmark, used to assess the baseline model's overall performance.
+        b) icu_only_head_to_head: A specific subgroup of patients who have ICU data, used for a fair, direct comparison between the baseline and advanced ICU models.
+    6. Within these groups, it trains, tunes, and rigorously evaluates the different models.
+    7. Finally, it compiles all the results into clear summary tables that compare the performance of all the models.
+"""
+def main():
+    start_time = time.time(); setup_environment(CONFIG)
+    try:
+        (master_train, master_test), raw_baseline_feats = load_and_prepare_master_data(CONFIG)
+        master_train.sort_values(by=sanitize_name(COL_TRAUMA_DATETIME), inplace=True)
+        
+        # Keep track of original order for TimeSeriesSplit
+        master_train = master_train.copy()
+        master_train['__order__'] = np.arange(len(master_train))
+
+        y_train_all = master_train[[COL_TARGET_ORDINAL_0_6, COL_TARGET_MORTALITY, COL_TARGET_FAVORABLE, COL_TARGET_GOSE_1_8, '__order__']]
+        y_test_all = master_test[[COL_TARGET_ORDINAL_0_6, COL_TARGET_MORTALITY, COL_TARGET_FAVORABLE, COL_TARGET_GOSE_1_8]]
+        
+        all_results = []
+
+        for h in CONFIG["FEATURE_ENGINEERING"]["PREDICTION_LANDMARKS_HOURS"]:
+            logging.info(f"\n{'='*25} PREDICTION LANDMARK: {h}h {'='*25}")
+
+            death_flag = f'Died_within_{h}h'
+            # Define patient risk sets for this landmark (survived past h hours)
+            train_pids_at_risk = master_train.index[~master_train[death_flag]]
+            test_pids_at_risk = master_test.index[~master_test[death_flag]]
+            logging.info(f"Risk Set @ {h}h: {len(train_pids_at_risk)} train, {len(test_pids_at_risk)} test patients.")
+
+            if len(train_pids_at_risk) < 50:
+                logging.warning(f"Train risk set for {h}h is too small ({len(train_pids_at_risk)}). Skipping landmark.")
+                continue
+
+            master_train_h = master_train.loc[train_pids_at_risk]
+            master_test_h = master_test.loc[test_pids_at_risk]
+
+            # --- Generate ALL features first ---
+            baseline_train_all = build_baseline_for_landmark(master_train_h, raw_baseline_feats, h)
+            baseline_test_all = build_baseline_for_landmark(master_test_h, raw_baseline_feats, h)
+            
+            icu_train = generate_dynamic_features_for_landmark(master_train_h, CONFIG["FILE_PATHS"]["ICU_DATA_FOLDER"], h, CONFIG)
+            icu_test = generate_dynamic_features_for_landmark(master_test_h, CONFIG["FILE_PATHS"]["ICU_DATA_FOLDER"], h, CONFIG)
+
+            features_for_sanity_check = [
+                'dyn_ICPm_mean', 'dyn_CPP_mean',         # Basic stats
+                'meta_has_ICPm', 'meta_has_CPP',         # Missingness flags
+                'dose_ICPm_auc_gt_20', 'dose_CPP_auc_lt_60' # New dose features
+            ]
+            perform_sanity_check_on_features(
+                dynamic_features_df=icu_train,
+                y_data=y_train_all, # The full outcome dataframe
+                features_to_check=features_for_sanity_check,
+                group_name=f"{h}h Training Set"
+            )
+
+            # --- Define the different cohorts for analysis ---
+            # Cohort 1: All patients at risk (for the overall baseline model)
+            pids_train_all = train_pids_at_risk
+            pids_test_all = test_pids_at_risk
+
+            # Cohort 2: Only patients with valid ICU data (for the head-to-head comparison)
+            pids_train_icu = icu_train.index
+            pids_test_icu = icu_test.index
+            
+            logging.info(f"ICU Cohort @ {h}h: Found {len(pids_train_icu)} train and {len(pids_test_icu)} test patients with ICU data.")
+
+            analysis_cohorts = {
+                "all_at_risk": (pids_train_all, pids_test_all),
+                "icu_only_head_to_head": (pids_train_icu, pids_test_icu)
+            }
+
+            for group_name, (train_pids, test_pids) in analysis_cohorts.items():
+                logging.info(f"\n--- Running Analysis Group: '{group_name}' for {h}h landmark ---")
+                
+                if len(train_pids) == 0:
+                    logging.warning(f"Skipping group '{group_name}' as it has no training patients.")
+                    continue
+
+                # Define the feature sets available for this specific cohort
+                feature_sets_to_run = {}
+                
+                # The "baseline_only" model can run on any cohort
+                feature_sets_to_run["baseline_only"] = (baseline_train_all.loc[train_pids], baseline_test_all.loc[test_pids])
+                
+                # The "baseline_plus_icu" model can ONLY run on the ICU cohort
+                if group_name == "icu_only_head_to_head":
+                    combined_train = baseline_train_all.loc[train_pids].join(icu_train.loc[train_pids], how='inner')
+                    combined_test = baseline_test_all.loc[test_pids].join(icu_test.loc[test_pids], how='inner')
+                    feature_sets_to_run["baseline_plus_icu"] = (combined_train, combined_test)
+
+                for fs_name, (X_train_raw, X_test_raw) in feature_sets_to_run.items():
+                    if X_train_raw.empty:
+                        logging.warning(f"Feature set '{fs_name}' is empty for training in group '{group_name}'. Skipping.")
+                        continue
+                    
+                    # --- INTEGRATED FEATURE SELECTION BLOCK ---
+                    if fs_name == "baseline_plus_icu" and CONFIG["FEATURE_SELECTION"]["ENABLE_ICU_SELECTION"]:
+                        # Separate the combined data back into baseline and ICU components for the selector
+                        baseline_cols = [c for c in X_train_raw.columns if c in baseline_train_all.columns]
+                        icu_cols = [c for c in X_train_raw.columns if c in icu_train.columns]
+                        
+                        X_baseline_train_fs = X_train_raw[baseline_cols]
+                        X_icu_train_fs = X_train_raw[icu_cols]
+                        
+                        # Align target variable with the training data for the selection model
+                        y_train_fs = y_train_all.loc[X_train_raw.index, COL_TARGET_ORDINAL_0_6]
+                        
+                        # Run the feature selection process
+                        selected_features = select_features_for_icu_model(
+                            X_baseline_train_fs, X_icu_train_fs, y_train_fs, CONFIG
+                        )
+                        
+                        # Overwrite the raw dataframes with the newly feature-selected versions
+                        X_train_raw = X_train_raw[selected_features]
+                        X_test_raw = X_test_raw.reindex(columns=selected_features, fill_value=np.nan)
+                    # --- END INTEGRATED FEATURE SELECTION BLOCK ---
+
+                    # Align data and run model
+                    X_train = drop_sparse_columns(X_train_raw, min_frac=0.25)
+                    # Crucial step for TimeSeriesSplit: preserve original time order
+                    X_train = X_train.join(y_train_all['__order__'], how='left').sort_values('__order__').drop(columns='__order__')
+                    
+                    # Ensure test set has same columns as train set after dropping sparse ones
+                    final_cols = X_train.columns.tolist()
+                    X_test = X_test_raw.reindex(columns=final_cols, fill_value=np.nan)
+                    
+                    y_train = y_train_all.loc[X_train.index]
+                    y_test = y_test_all.loc[X_test.index]
+                    n_test_effective = y_test[COL_TARGET_ORDINAL_0_6].notna().sum()
+
+                    for model_name in [MODEL_XGB, MODEL_ORDINAL]:
+                        if model_name == MODEL_ORDINAL and not MORD_AVAILABLE: continue
+                        logging.info(f"--- Training: {model_name} | {fs_name} | Group: {group_name} ---")
+
+                        pipeline, cv_qwk = fit_and_tune_model(X_train, y_train[COL_TARGET_ORDINAL_0_6], model_name, CONFIG)
+
+                        if pipeline:
+                            logging.info(f"  > Best CV QWK: {cv_qwk:.4f}")
+                            model_info = {
+                                'h': h,
+                                'fs_name': fs_name,
+                                'model_name': model_name,
+                                'comparison_group': group_name
+                            }
+                            evaluate_and_save_artifacts(pipeline, X_test, y_test, model_info, X_train.copy(), CONFIG)
+
+                            # Calculate final test metrics for the summary table
+                            test_mask = y_test[COL_TARGET_ORDINAL_0_6].notna()
+                            test_qwk = np.nan
+                            test_acc = np.nan
+                            auroc_mortality = np.nan
+                            auroc_favorable = np.nan
+
+                            if test_mask.any():
+                                # --- Ordinal Predictions ---
+                                y_true_test_ord = y_test.loc[test_mask, COL_TARGET_ORDINAL_0_6].values
+                                y_pred_test_ord = pipeline.predict(X_test.loc[test_mask])
+
+                                clf_step = pipeline.named_steps['classifier']
+                                if MORD_AVAILABLE and isinstance(clf_step, (mord.LogisticAT, getattr(mord, 'LogisticIT', tuple()))):
+                                    y_pred_test_ord = y_pred_test_ord - 1
+                                
+                                test_qwk = cohen_kappa_score(y_true_test_ord, y_pred_test_ord, weights='quadratic')
+                                test_acc = accuracy_score(y_true_test_ord, y_pred_test_ord)
+
+                                # --- Probabilistic Predictions for AUROC ---
+                                if hasattr(clf_step, "predict_proba"):
+                                    try:
+                                        y_pred_proba_all = pipeline.predict_proba(X_test.loc[test_mask])
+                                        classes = getattr(clf_step, "classes_", np.arange(y_pred_proba_all.shape[1]))
+                                        if np.issubdtype(classes.dtype, np.integer) and classes.min() == 1:
+                                            classes = classes - 1
+                                        cls_to_idx = {int(c): i for i, c in enumerate(classes)}
+
+                                        # Mortality/VS AUROC
+                                        dead_vs_idx = cls_to_idx.get(0)
+                                        if dead_vs_idx is not None:
+                                            y_prob_dv = y_pred_proba_all[:, dead_vs_idx]
+                                            y_true_dv = (y_test.loc[test_mask, COL_TARGET_GOSE_1_8].isin([1, 2])).astype(int).values
+                                            auroc_mortality = roc_auc_score(y_true_dv, y_prob_dv)
+
+                                        # Favorable Outcome AUROC
+                                        fav_indices = [cls_to_idx.get(c) for c in classes if c >= 3 and cls_to_idx.get(c) is not None]
+                                        if fav_indices:
+                                            y_prob_fav = y_pred_proba_all[:, fav_indices].sum(axis=1)
+                                            y_true_fav = y_test.loc[test_mask, COL_TARGET_FAVORABLE].values
+                                            auroc_favorable = roc_auc_score(y_true_fav, y_prob_fav)
+                                            
+                                    except Exception as e:
+                                        logging.warning(f"Could not calculate AUROC for summary table: {e}")
+
+                            all_results.append({
+                                'landmark_h': h,
+                                'comparison_group': group_name,
+                                'feature_set': fs_name,
+                                'model': model_name,
+                                'cv_qwk': cv_qwk,
+                                'test_qwk': test_qwk,
+                                'test_accuracy': test_acc,
+                                'auroc_mortality': auroc_mortality,
+                                'auroc_favorable': auroc_favorable,
+                                'n_train': len(X_train),
+                                'n_test': n_test_effective,
+                                'n_features': X_train.shape[1]
+                            })
+
+        if not all_results: raise RuntimeError("No models were successfully trained.")
+        df_summary = pd.DataFrame(all_results)
+        logging.info("\n\n" + "="*30 + " FINAL RESULTS SUMMARY " + "="*30)
+
+        # Pivot for the head-to-head comparison on the ICU-only cohort
+        df_head_to_head = df_summary[df_summary['comparison_group'] == 'icu_only_head_to_head']
+        if not df_head_to_head.empty:
+            pivot_h2h = df_head_to_head.pivot_table(index=['landmark_h', 'model'], columns='feature_set', values='test_qwk')
+            logging.info("\n--- Test QWK Head-to-Head Comparison (ICU Patient Cohort Only) ---\n" + pivot_h2h.to_string(float_format="%.3f"))
+        
+        logging.info(
+            "\n--- Full Detailed Results (Grouped by Landmark) ---\n" + 
+            df_summary.sort_values(
+                by=["landmark_h", "comparison_group", "feature_set", "model"], 
+                ascending=[True, True, True, True]
+            ).to_string(index=False, float_format="%.3f")
+        )
+        df_summary.to_csv(os.path.join(CONFIG["RUN_INFO"]["OUTPUT_FOLDER"], "final_results_summary.csv"), index=False)
+
+    except Exception as e:
+        logging.exception("An error occurred during the main pipeline execution.")
+        sys.exit(1)
+    finally:
+        logging.info(f"\n--- Pipeline finished in {(time.time() - start_time) / 60:.2f} minutes ---")
+
+
+if __name__ == "__main__":
+    main()
