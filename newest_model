@@ -32,6 +32,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.metrics import (
     make_scorer, cohen_kappa_score, roc_auc_score, average_precision_score,
     brier_score_loss, ConfusionMatrixDisplay, accuracy_score, RocCurveDisplay)
+from sklearn.feature_selection import RFE 
 from joblib import dump
 from tqdm import tqdm
 
@@ -118,10 +119,10 @@ CONFIG = {
     "MODELING": {
         "RANDOM_STATE": 1, "CV_SPLITS": 5, "HYPERPARAM_N_ITER": 30, "N_JOBS": -1,
         "PARAM_GRIDS": {
-            MODEL_XGB: {'classifier__n_estimators': [200, 300, 400], 'classifier__max_depth': [3, 4],
+            MODEL_XGB: {'classifier__n_estimators': [200, 300, 400], 'classifier__max_depth': [2, 3, 4],
                 'classifier__learning_rate': [0.03, 0.06, 0.1], 'classifier__subsample': [0.6, 0.7, 0.8],
-                'classifier__colsample_bytree': [0.6, 0.7, 0.8], 'classifier__gamma': [0.5, 1.0, 2, 5],
-                'classifier__reg_lambda': [3, 5, 10], 'classifier__reg_alpha': [0, 0.5, 1],
+                'classifier__colsample_bytree': [0.6, 0.8, 1.0], 'classifier__gamma': [0.5, 1.0, 2, 5],
+                'classifier__reg_lambda': [1, 1.5, 2], 'classifier__reg_alpha': [0, 0.5, 1],
                 "classifier__min_child_weight": [10, 20, 30]
             },
             MODEL_ORDINAL: {
@@ -130,7 +131,7 @@ CONFIG = {
         }
     },
     "ARTIFACTS": {"SHAP_SAMPLE_SIZE": 1000, "BOOTSTRAP_N": 1000, "GOSE_ORDINAL_LABELS": {0: "Dead/VS", 1: "Sev-L", 2: "Sev-H", 3: "Mod-L", 4: "Mod-H", 5: "Good-L", 6: "Good-H"}},
-    "FEATURE_SELECTION": {"ENABLE_ICU_SELECTION": True, "TOP_N_ICU_FEATURES": 25} # Select the 25 most important ICU features
+    "FEATURE_SELECTION": {"ENABLE_ICU_SELECTION": True, "TOP_N_ICU_FEATURES": 15, "RFE_STEP": 0.1} # Select the 25 most important ICU features
     
 }
 
@@ -275,24 +276,61 @@ def read_icu_table(path: str) -> pd.DataFrame | None:
         logging.warning(f"[ICU] Failed to parse {os.path.basename(path)}. Error: {e}")
         return None
 
+def _try_parse_with_formats(s: pd.Series) -> pd.Series:
+    """Try a few common datetime formats fast; fall back quietly to coerce+cache."""
+    common = [
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"
+    ]
+    s = s.astype(str)
+    for fmt in common:
+        try:
+            return pd.to_datetime(s, format=fmt, errors="raise")
+        except Exception:
+            continue
+    return pd.to_datetime(s, errors="coerce", cache=True)
+
 # This function makes sure that each ICU data table has a proper, standardized timestamp column.
 # It intelligently searches for columns that likely represent time (e.g., 'time', 'clock',
 # or a combination of 'date' and 'tid') and converts them into a consistent format that the
 # program can use for time-based analysis.
 def ensure_icu_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a standardized datetime column for ICU records.
+
+    Priority:
+      1) Use the sanitized ICU time column if it exists.
+      2) Else, try to build from a likely time column (e.g., 'time', 'tid', 'timestamp', 'clock')
+         and, if available, a separate date column (containing 'date').
+    Result is stored in the sanitized name of COL_ICU_TIME.
+    """
     s_icu_time = sanitize_name(COL_ICU_TIME)
+
+    # Case 1: standardized ICU time column already present
     if s_icu_time in df.columns:
-        # <<< FIX 4: PERFORMANCE NICETY >>> Add cache=True to speed up parsing of repeated non-standard datetime strings
-        df[s_icu_time] = pd.to_datetime(df[s_icu_time], errors='coerce', cache=True)
+        # Only parse if not already datetime64
+        if not np.issubdtype(df[s_icu_time].dtype, np.datetime64):
+            df[s_icu_time] = _try_parse_with_formats(df[s_icu_time])
         return df
-    time_candidates = [c for c in df.columns if any(k in c.lower() for k in ['time', 'tid', 'timestamp', 'clock'])]
+
+    # Case 2: infer from other columns
+    # Look for a time-like column
+    time_candidates = [c for c in df.columns
+                       if any(k in c.lower() for k in ['time', 'tid', 'timestamp', 'clock'])]
     if time_candidates:
         dt_col = time_candidates[0]
-        date_candidates = [c for c in df.columns if 'date' in c.lower() and c != dt_col]
+
+        # If a separate date-like column exists, combine "date + time"
+        date_candidates = [c for c in df.columns
+                           if ('date' in c.lower()) and (c != dt_col)]
         if date_candidates:
-            df[s_icu_time] = pd.to_datetime(df[date_candidates[0]].astype(str) + ' ' + df[dt_col].astype(str), errors='coerce', cache=True)
+            combined = df[date_candidates[0]].astype(str).str.strip() + ' ' + df[dt_col].astype(str).str.strip()
+            df[s_icu_time] = _try_parse_with_formats(combined)
         else:
-            df[s_icu_time] = pd.to_datetime(df[dt_col], errors='coerce', cache=True)
+            df[s_icu_time] = _try_parse_with_formats(df[dt_col])
+
+    # If no candidates found, or parsing failed, caller will handle downstream
     return df
 
 # This function cleans the ICU data by removing clinically implausible values. For example,
@@ -964,15 +1002,15 @@ def create_dynamic_features_from_patient_data(
             continue
 
         # Global summary on raw points
+        n_raw = int(series.size)
         all_features[f'dyn_{var}_mean'] = float(series.mean())
-        all_features[f'dyn_{var}_std']  = float(series.std(ddof=0))
+        all_features[f'dyn_{var}_std']  = float(series.std(ddof=0)) if n_raw >= 2 else 0.0
         all_features[f'dyn_{var}_q90']  = float(series.quantile(0.90))
         all_features[f'dyn_{var}_q10']  = float(series.quantile(0.10))
-        all_features[f'dyn_{var}_count'] = int(series.size)
-        if series.size > 1:
-            all_features[f'dyn_{var}_mean_abs_diff'] = float(np.mean(np.abs(np.diff(series.values))))
-        else:
-            all_features[f'dyn_{var}_mean_abs_diff'] = 0.0
+        all_features[f'dyn_{var}_count'] = n_raw
+        all_features[f'dyn_{var}_mean_abs_diff'] = (
+            float(np.mean(np.abs(np.diff(series.values)))) if n_raw >= 2 else 0.0
+        )
 
         # Align to 1-min grid for time-based stats (time-weighted by construction)
         g = _grid_align(series, grid_index, ffill_minutes)
@@ -988,21 +1026,25 @@ def create_dynamic_features_from_patient_data(
         # ---- Begin window: [0, begin_h] ----
         if begin_h > 0:
             begin_g = g.loc[:pd.to_timedelta(begin_h, 'h')].dropna()
-            if begin_g.size > 0:
+            nb = int(begin_g.size)
+            if nb > 0:
                 all_features[f'dyn_{var}_begin_mean'] = float(begin_g.mean())
-                if begin_g.size > 1:
+                if nb >= 2:
                     xh = begin_g.index.total_seconds() / 3600.0
                     all_features[f'dyn_{var}_begin_slope'] = float(np.polyfit(xh, begin_g.values, 1)[0])
+
 
         # ---- End window: [H - end_h, H] ----
         if end_h > 0:
             end_g = g.loc[pd.to_timedelta(end_start_h, 'h'):pd.to_timedelta(H, 'h')].dropna()
-            if end_g.size > 0:
+            ne = int(end_g.size)
+            if ne > 0:
                 all_features[f'dyn_{var}_end_mean'] = float(end_g.mean())
-                if end_g.size > 1:
+                if ne >= 2:
                     all_features[f'dyn_{var}_end_var']  = float(end_g.var(ddof=0))
                     xh = end_g.index.total_seconds() / 3600.0
                     all_features[f'dyn_{var}_end_slope'] = float(np.polyfit(xh, end_g.values, 1)[0])
+
 
     # ---------- Event burdens ----------
     for var_key, conditions in fe_cfg["EVENT_BURDEN_VARS"].items():
@@ -1200,6 +1242,8 @@ def generate_dynamic_features_for_landmark(master_df_landmark: pd.DataFrame, icu
                 patient_stats[pid] = 'empty_icu_file'
                 continue
 
+            df_pat = df_pat.copy(deep=True)
+
             df_pat.columns = [sanitize_name(c) for c in df_pat.columns]
             df_pat = ensure_icu_timestamp(df_pat)
             s_icu_time = sanitize_name(COL_ICU_TIME)
@@ -1212,7 +1256,6 @@ def generate_dynamic_features_for_landmark(master_df_landmark: pd.DataFrame, icu
                 patient_stats[pid] = 'no_trauma_datetime'
                 continue
             df_pat[COL_TIME_AFTER_TRAUMA] = df_pat[s_icu_time] - trauma_dt
-            df_pat = df_pat.copy()
 
             # Cut to [0, H]
             df_pat_h = df_pat[(df_pat[COL_TIME_AFTER_TRAUMA] >= pd.Timedelta(0)) & (df_pat[COL_TIME_AFTER_TRAUMA] <= pd.to_timedelta(landmark_h, 'h'))].copy()
@@ -1260,12 +1303,10 @@ def generate_dynamic_features_for_landmark(master_df_landmark: pd.DataFrame, icu
     logging.info(f"Successfully generated dynamic features for {len(dynamic_features_df)} patients at {landmark_h}h.")
     return dynamic_features_df
 
-# After generating hundreds of new features from the ICU data, this function intelligently selects
-# the most important ones to use in our final predictive model. It works by training a quick
-# 'pre-screening' model to rank all the new ICU features based on their predictive power. It then
-# picks the best-performing 'Top N' features and combines them with the essential baseline patient
-# information (like age, sex, and initial GCS). This helps prevent the model from being overwhelmed
-# by too much information and focuses it on the variables that matter most.
+# This function intelligently selects the most important ICU features to use in our final predictive model.
+# It now uses a powerful technique called Recursive Feature Elimination (RFE) for this task. RFE works
+# by repeatedly building a model, removing the weakest features, and rebuilding the model until only
+# the strongest, most predictive features remain. This helps the model focus on what matters most.
 def select_features_for_icu_model(
     X_baseline: pd.DataFrame,
     X_icu: pd.DataFrame,
@@ -1273,17 +1314,20 @@ def select_features_for_icu_model(
     cfg: Dict
 ) -> list:
     """
-    Rank ICU features using a fast XGB trained on ICU-only columns (original names),
-    then return ALL baseline features + top-N ICU columns.
+    Selects top ICU features using Recursive Feature Elimination (RFE) with an XGBoost estimator.
+    It then returns a final list containing ALL baseline features + the selected top-N ICU features.
     """
     fs_cfg = cfg["FEATURE_SELECTION"]
     top_n_icu = int(fs_cfg["TOP_N_ICU_FEATURES"])
+    rfe_step = fs_cfg.get("RFE_STEP", 0.1) # New config parameter for RFE step size
 
     if X_icu.empty:
         logging.warning("ICU feature matrix is empty; selecting baseline only.")
         return X_baseline.columns.tolist()
 
-    # Keep numeric ICU columns and enforce a coverage gate
+    # --- Step 1: Initial Data Cleaning (same as before) ---
+    # We start by keeping only the numeric ICU variables and filtering out any that have
+    # too much missing data (e.g., less than 50% of values present) to be reliable.
     X_icu_num = X_icu.select_dtypes(include=np.number)
     if X_icu_num.shape[1] == 0:
         logging.warning("No numeric ICU features; selecting baseline only.")
@@ -1294,62 +1338,60 @@ def select_features_for_icu_model(
     if not keep_cols:
         logging.warning("No ICU features pass coverage >=50%; falling back to baseline only.")
         return X_baseline.columns.tolist()
-    if len(keep_cols) < X_icu_num.shape[1]:
-        logging.info(f"Coverage filter kept {len(keep_cols)}/{X_icu_num.shape[1]} ICU features (>=50% non-NaN).")
+    logging.info(f"Coverage filter kept {len(keep_cols)}/{X_icu_num.shape[1]} ICU features for RFE (>=50% non-NaN).")
     X_icu_num = X_icu_num[keep_cols]
 
-    # Align target, drop NaNs in y, and sync X rows to y
+    # Align the patient features with their known outcomes.
     y_aligned = y.loc[X_icu_num.index].dropna().astype(int)
     X_icu_num = X_icu_num.loc[y_aligned.index]
 
-    if X_icu_num.shape[1] == 0 or X_icu_num.shape[0] == 0:
-        logging.warning("ICU selection: no usable rows/columns after alignment; selecting baseline only.")
+    if X_icu_num.empty:
+        logging.warning("ICU selection: no usable rows after alignment; selecting baseline only.")
         return X_baseline.columns.tolist()
 
-    # Simple imputation; trees don’t need scaling
-    num_feats = X_icu_num.columns.tolist()
-    pre = ColumnTransformer(
-        transformers=[('num', SimpleImputer(strategy='constant', fill_value=np.nan), num_feats)],
-        remainder='drop',
-        verbose_feature_names_out=False
-    )
-
-    selector = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
+    # --- Step 2: Set up the RFE Process ---
+    # The RFE process needs a model to help it decide which features are important. We'll use a
+    # relatively simple and fast version of our main XGBoost model for this task.
+    selector_model = xgb.XGBClassifier(
+        n_estimators=50,  # Fewer estimators for speed
+        max_depth=3,      # Shallower trees for speed
         learning_rate=0.1,
         random_state=cfg["MODELING"]["RANDOM_STATE"],
         n_jobs=cfg["MODELING"]["N_JOBS"],
         tree_method='hist'
-        # You can also set importance_type='total_gain' for stability in some setups.
     )
 
-    pipe = Pipeline([('preprocessor', pre), ('selector', selector)])
+    # We wrap our model in the RFE tool. We tell it how many features we ultimately want to select
+    # and how many to remove at each step. This process can be slow, so we log its progress.
+    rfe = RFE(
+        estimator=selector_model,
+        n_features_to_select=top_n_icu,
+        step=rfe_step,  # Remove 10% of features at each iteration
+        verbose=1      # Log progress to the console
+    )
+
+    # Just like our main model, the RFE process needs a preprocessor to handle missing values.
+    # We create a pipeline that first imputes missing data, then runs the RFE selection process.
+    num_feats = X_icu_num.columns.tolist()
+    pre = ColumnTransformer(
+        transformers=[('num', SimpleImputer(strategy='median'), num_feats)],
+        remainder='drop',
+        verbose_feature_names_out=False
+    )
+    pipe = Pipeline([('preprocessor', pre), ('selector', rfe)])
+    
+    logging.info(f"Starting RFE to select {top_n_icu} features from {X_icu_num.shape[1]} candidates. This may take a while...")
     pipe.fit(X_icu_num, y_aligned)
-    logging.info(f"Selector debug: X_icu_num.shape={X_icu_num.shape}, "
-             f"importances={pipe.named_steps['selector'].feature_importances_.shape}")
 
-    importances = pipe.named_steps['selector'].feature_importances_
+    # --- Step 3: Get the Results and Return ---
+    # After the process is complete, we get a list of the features that survived the elimination.
+    support_mask = pipe.named_steps['selector'].support_
+    top_icu_cols = X_icu_num.columns[support_mask].tolist()
 
-    # Use the exact columns that were fed to the selector (stable across sklearn versions)
-    feat_names = list(X_icu_num.columns)
-
-    # Safety guard in case something ever changes upstream
-    if len(feat_names) != len(importances):
-        logging.warning(
-            f"Selector names/importances length mismatch "
-            f"(names={len(feat_names)}, importances={len(importances)}). "
-            f"Falling back to positional names."
-        )
-        feat_names = [f'col_{i}' for i in range(len(importances))]
-
-    imp = (
-        pd.DataFrame({'feature': feat_names, 'importance': importances})
-        .sort_values('importance', ascending=False)
-    )
-
-    top_icu_cols = [f for f in imp['feature'].tolist() if f in X_icu_num.columns][:top_n_icu]
-    logging.info(f"Selected {len(top_icu_cols)} ICU features (top {top_n_icu}): {top_icu_cols[:5]}...")
+    logging.info(f"RFE selected {len(top_icu_cols)} ICU features: {top_icu_cols[:5]}...")
+    
+    # The final list of features for our main model will include all the baseline clinical variables
+    # PLUS the top-performing ICU variables identified by the RFE process.
     return X_baseline.columns.tolist() + top_icu_cols
 
 # ============================== MODELING & EVALUATION ====================================
