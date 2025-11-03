@@ -94,7 +94,7 @@ CONFIG = {
     "FILE_PATHS": {"MASTER_FILE_PATH": "./data/RawICUData/master_file.csv", "ICU_DATA_FOLDER": "./data/RawICUData/"},
     "DATA_PROCESSING": {
         "TEST_SET_FRACTION": 0.20,
-        "SPLIT_STRATEGY": "stratified", #stratified or temporal (also change cv_type in MODELING). Set class_weights='none' for temporal split and balanced for stratified.
+        "SPLIT_STRATEGY": "temporal", #stratified or temporal (also change cv_type in MODELING). Set class_weights='none' for temporal split and balanced for stratified.
         "GOSE_FOLLOWUP_MAX_MONTHS": 12,
         "MAX_TRAUMA_UNCERTAINTY_HRS": 6,
         "MAX_AGE_INCLUSIVE": 120
@@ -132,9 +132,9 @@ CONFIG = {
         "RANDOM_STATE": 1, "CV_SPLITS": 5, "HYPERPARAM_N_ITER": 50, "N_JOBS": -1, #(CV splits 5, hyperparam 50)
         "THRESHOLD_MODE": "hybrid",   # one of: "qwk", "prior", "hybrid".
         "PRIOR_WEIGHT": 0.15,          # how much to pull towards prior-matched cutpoints. Higher = more QWK, Lower = more prior-matching.
-        "CLASS_WEIGHTS": "balanced", # Suggest set class_weights='none' for temporal split and "balanced" for stratified. Consider class specific {0: 1.0, 1: 1.5, 2: 0.8, 3: 1.25, 4: 1.0, 5: 1.0, 6: 1.5}. 
+        "CLASS_WEIGHTS": "none", # Suggest set class_weights='none' for temporal split and "balanced" for stratified. Consider class specific {0: 1.0, 1: 1.5, 2: 0.8, 3: 1.25, 4: 1.0, 5: 1.0, 6: 1.5}. 
         "CLASS_WEIGHT_EXPONENT": 0.25, # only used if CLASS_WEIGHTS='balanced', higher=more focus on rare categories.
-        "CV_TYPE": "stratified", # 'stratified' or 'timeseries' (also change split_strategy in DATA_PROCESSING)
+        "CV_TYPE": "timeseries", # 'stratified' or 'timeseries' (also change split_strategy in DATA_PROCESSING)
         "PARAM_GRIDS": {
             MODEL_XGB: {'classifier__n_estimators': [400, 600, 800, 1000], 'classifier__max_depth': [1, 3, 4, 6, 8],
                 'classifier__learning_rate': [0.03, 0.06, 0.1], 'classifier__subsample': [0.5, 0.7, 1.0],
@@ -798,12 +798,12 @@ def load_and_prepare_master_data(cfg: Dict) -> Tuple[Tuple[pd.DataFrame, pd.Data
         if s_verbal_score in df_master.columns: df_master.loc[intub_mask, s_verbal_score] = np.nan
     else:
         df_master['GCSV_intubated'] = 0
-    df_master[s_gcs_sum] = df_master[[c for c in [s_eye_score, s_verbal_score, s_motor_score] if c in df_master.columns]].sum(axis=1, min_count=1)
+    df_master[s_gcs_sum] = df_master[[c for c in [s_eye_score, s_verbal_score, s_motor_score] if c in df_master.columns]].sum(axis=1, min_count=3)
 
     df_before_gcs = df_master.copy()
-    gcs_mask = (df_master[s_gcs_sum] >= 3) & (df_master[s_gcs_sum] <= 13)
+    gcs_mask = (df_master[s_gcs_sum] >= 3) & (df_master[s_gcs_sum] <= 12)
     df_master = df_master[gcs_mask]
-    df_master = log_step(df_before_gcs, df_master, "Mild TBI (GCS > 13) or GCS < 3 or GCS not calculable", "Patients with moderate/severe TBI")
+    df_master = log_step(df_before_gcs, df_master, "Mild TBI (GCS > 12) or GCS < 3 or GCS not calculable", "Patients with moderate/severe TBI")
 
     # --- Age Filtering ---
     max_age = cfg["DATA_PROCESSING"].get("MAX_AGE_INCLUSIVE")
@@ -1159,7 +1159,6 @@ def _episode_metrics_from_mask(values: pd.Series,
             "peak_mean": np.nan,
             "iei_mean_mins": np.nan,
             "iei_cv": np.nan,
-            "iei_burstiness": np.nan,
             "recovery_median_mins": np.nan,
             "recovery_mean_mins": np.nan,
         })
@@ -1184,7 +1183,6 @@ def _episode_metrics_from_mask(values: pd.Series,
             "peak_mean": np.nan,
             "iei_mean_mins": np.nan,
             "iei_cv": np.nan,
-            "iei_burstiness": np.nan,
             "recovery_median_mins": np.nan,
             "recovery_mean_mins": np.nan,
         })
@@ -1222,7 +1220,6 @@ def _episode_metrics_from_mask(values: pd.Series,
     else:
         out["iei_mean_mins"] = np.nan
         out["iei_cv"] = np.nan
-        out["iei_burstiness"] = np.nan
 
     # Recovery metrics (optional)
     if recovery_to is None:
@@ -1719,7 +1716,7 @@ def audit_event_burdens_and_episodes(icu_df: pd.DataFrame, h: int, cfg: Dict, sp
         epi.update({f"n_episodes_{k}": v for k, v in _summ_stats(s_n, any_icp).items()})
         epi.update({f"tot_mins_{k}": v for k, v in _summ_stats(s_tot, any_icp).items()})
 
-        for extra in ["longest_mins","peak_max","peak_mean","time_to_first_min","recovery_median_mins","iei_mean_mins","iei_cv","iei_burstiness"]:
+        for extra in ["longest_mins","peak_max","peak_mean","time_to_first_min","recovery_median_mins","iei_mean_mins","iei_cv"]:
             c = f"evt_ICPm_{thr_tag}_{extra}"
             if c in icu_df.columns:
                 epi.update({f"{extra}_{k}": v for k, v in _summ_stats(icu_df[c], any_icp).items()})
@@ -2130,22 +2127,37 @@ def generate_publication_tables(
                 df[col] = False
         return df
 
+    # <<< MODIFIED/ADDED SECTION: Panel B and Demographics Table Logic >>>
+    # This entire helper function has been rewritten to align with the new inclusion criteria.
     def _panel_b(df_after_A_truth: pd.DataFrame, landmark_h: int, cohort_data: Dict) -> Tuple[pd.DataFrame, set]:
-        rows, start_ids = [], set(df_after_A_truth[s_id].astype(str))
-        rows.append(("Carryover from Panel A (Analysis-Ready Cohort)", len(start_ids)))
-        death_flag_col = f'Died_within_{landmark_h}h'
-        died_mask = df_after_A_truth.get(death_flag_col, pd.Series(False, index=df_after_A_truth.index))
-        num_died = int(died_mask.sum())
-        df_alive = df_after_A_truth[~died_mask]
-        alive_ids = set(df_alive[s_id].astype(str))
-        rows.append((f"  — Excluded: died before {landmark_h}h", num_died))
-        rows.append((f"Patients alive at {landmark_h}h", len(alive_ids)))
+        """
+        Generates Panel B of the flowchart, showing the derivation of the ICU head-to-head cohort
+        for a specific landmark, reflecting the new inclusion criteria (no exclusion for early death/discharge).
+        """
+        rows = []
+        
+        # Start with the total modeling cohort from Panel A
+        full_cohort_key = f"full_cohort_{landmark_h}h_ids"
+        full_cohort_ids = {str(x) for x in cohort_data.get(full_cohort_key, set())}
+        if not full_cohort_ids: # Fallback if key is missing from main loop
+            full_cohort_ids = set(df_after_A_truth[s_id].astype(str))
+        rows.append((f"Total analysis cohort from Panel A @ {landmark_h}h", len(full_cohort_ids)))
+
+        # Identify the subset with valid ICU data for the head-to-head comparison
         h2h_key = f"h2h_{landmark_h}h_ids"
         ids_h2h = {str(x) for x in cohort_data.get(h2h_key, set())}
-        final_ids = alive_ids & ids_h2h
-        rows.append((f"  — Excluded: discharged or no valid ICU data before {landmark_h}h", len(alive_ids) - len(final_ids)))
-        rows.append((f"Final analysis cohort @ {landmark_h}h", len(final_ids)))
-        return pd.DataFrame(rows, columns=["Criterion", "Patients Remaining"]), final_ids
+
+        # The difference is patients without sufficient ICU data for the landmark window
+        num_excluded = len(full_cohort_ids) - len(ids_h2h)
+        rows.append((f"  — Excluded: No valid ICU data within {landmark_h}h window", num_excluded))
+        
+        # This is the final cohort for which demographics will be generated
+        rows.append((f"Final ICU head-to-head cohort @ {landmark_h}h", len(ids_h2h)))
+        
+        # This function must return the set of IDs for the cohort being described in the demographics table
+        final_ids_for_demographics = ids_h2h
+
+        return pd.DataFrame(rows, columns=["Criterion", "Patients Remaining"]), final_ids_for_demographics
 
     def _ensure_gose_numeric(df: pd.DataFrame) -> str:
         s_out = sanitize_name(COL_OUTCOME)
@@ -2856,8 +2868,9 @@ def generate_insult_burden_table(
     for h in cfg["FEATURE_ENGINEERING"]["PREDICTION_LANDMARKS_HOURS"]:
         logging.info(f"  [Insult Table] Processing cohort for {h}h landmark...")
         master_full_h_potential = pd.concat([master_train_df, master_test_df])
-        death_flag = f'Died_within_{h}h'
-        pids_at_risk = master_full_h_potential.index[~master_full_h_potential[death_flag].fillna(True)]
+        
+        # <<< MODIFIED: This logic is simplified to use all patients, consistent with main()
+        pids_at_risk = master_full_h_potential.index
         master_at_risk_h = master_full_h_potential.loc[pids_at_risk]
 
         icu_features_h = generate_dynamic_features_for_landmark(
@@ -2902,7 +2915,7 @@ def generate_insult_burden_table(
             "ICP > 20 mmHg Episodes": "icp_gt20",
             "Double-Hit (ICP > 20 & CPP < 50)": "double_icpcpp",
             "Double-Hit (ICP > 20 & PRx > 0.3)": "double_icpprx",
-            "Triple-Hit (ICP, CPP, & PRx)": "triple_hit"
+            "Triple-Hit (ICP, CPP, & PRx)": "triple" # Corrected key
         }
         for label, key_prefix in complex_map.items():
             n_pat = insult_summary.get(f'n_patients_{key_prefix}', 0)
@@ -2933,8 +2946,6 @@ def generate_insult_burden_table(
             if is_first_landmark: row_labels.append(f"{var_key.upper()} Burden")
             col_values.append("")
             
-            # ===== THIS IS THE ONLY LINE THAT CHANGED =====
-            # Sort by the key ('above', 'below') in reverse alphabetical order, so 'below' comes first.
             for direction, thresholds in sorted(conditions.items(), key=lambda item: item[0], reverse=True):
                 for t in thresholds:
                     base_key = f"burden_{var_key}_{direction}_{t}"
@@ -2973,10 +2984,10 @@ def generate_insult_burden_table(
     The key steps it performs are:
     1. Loads the master patient database and splits it into a training set (older data) and a test set (newer data).
     2. Repeats the entire modeling process at different time points after injury (e.g., 24h, 48h), which we call 'landmarks'.
-    3. For each landmark, it correctly identifies the group of patients who were still alive and at risk.
+    3. For each landmark, it now includes ALL admitted patients, even those who died early, to provide the model with a complete picture of patient trajectories.
     4. It then generates all the necessary predictor variables, from simple baseline data to the complex dynamic features from ICU monitoring.
     5. It defines two important patient groups for comparison:
-        a) all_at_risk: All patients alive at the landmark, used to assess the baseline model's overall performance.
+        a) all_admitted: All patients in the study, used to assess the baseline model's overall performance.
         b) icu_only_head_to_head: A specific subgroup of patients who have ICU data, used for a fair, direct comparison between the baseline and advanced ICU models.
     6. Within these groups, it trains, tunes, and rigorously evaluates the different models.
     7. Finally, it compiles all the results into clear summary tables that compare the performance of all the models.
@@ -3009,23 +3020,25 @@ def main():
         for h in CONFIG["FEATURE_ENGINEERING"]["PREDICTION_LANDMARKS_HOURS"]:
             logging.info(f"\n{'='*25} PREDICTION LANDMARK: {h}h {'='*25}")
             
-            # ---  RIGOROUS AND CORRECT COHORT DEFINITION FOR LANDMARK 'h' ---
+            # <<< MODIFIED/ADDED SECTION: New Cohort Definition >>>
+            # The cohort for a landmark now includes ALL admitted patients, even those who died or were discharged early.
+            # This allows the model to learn from the full spectrum of patient trajectories.
             master_train_h_potential = master_train.copy()
             master_test_h_potential = master_test.copy()
 
-            death_flag = f'Died_within_{h}h'
-            train_pids_at_risk = master_train_h_potential.index[~master_train_h_potential[death_flag].fillna(True)]
-            test_pids_at_risk = master_test_h_potential.index[~master_test_h_potential[death_flag].fillna(True)]
+            logging.info(f"Defining cohort for {h}h landmark (includes all admitted patients, including those who died/discharged early).")
+            train_pids_for_landmark = master_train_h_potential.index
+            test_pids_for_landmark = master_test_h_potential.index
             
-            if len(train_pids_at_risk) < 50:
-                logging.warning(f"Train risk set for {h}h is too small ({len(train_pids_at_risk)}). Skipping landmark.")
+            if len(train_pids_for_landmark) < 50:
+                logging.warning(f"Train cohort for {h}h is too small ({len(train_pids_for_landmark)}). Skipping landmark.")
                 continue
 
-            master_train_h = master_train_h_potential.loc[train_pids_at_risk]
-            master_test_h = master_test_h_potential.loc[test_pids_at_risk]
+            master_train_h = master_train_h_potential.loc[train_pids_for_landmark]
+            master_test_h = master_test_h_potential.loc[test_pids_for_landmark]
             
-            logging.info(f"Correct Risk Set @ {h}h: {len(master_train_h)} train, {len(master_test_h)} test patients.")
-
+            logging.info(f"Full Cohort @ {h}h: {len(master_train_h)} train, {len(master_test_h)} test patients.")
+            
             baseline_train_all = build_baseline_for_landmark(master_train_h, raw_baseline_feats, h)
             baseline_test_all = build_baseline_for_landmark(master_test_h, raw_baseline_feats, h)
             
@@ -3044,14 +3057,17 @@ def main():
             except Exception as e:
                 logging.warning(f"[AUDIT] Event/episode audit failed for {h}h: {e}", exc_info=False)
 
-            pids_train_all = train_pids_at_risk
-            pids_test_all = test_pids_at_risk
+            pids_train_all = train_pids_for_landmark
+            pids_test_all = test_pids_for_landmark
             pids_train_icu = icu_train.index
             pids_test_icu = icu_test.index
             logging.info(f"ICU Cohort @ {h}h: Found {len(pids_train_icu)} train and {len(pids_test_icu)} test patients with ICU data.")
-            cohort_data_for_tables[f"at_risk_{h}h_ids"] = set(train_pids_at_risk).union(set(test_pids_at_risk))
+            
+            # Populate data for the publication tables function
+            cohort_data_for_tables[f"full_cohort_{h}h_ids"] = set(pids_train_all).union(set(pids_test_all))
             cohort_data_for_tables[f"h2h_{h}h_ids"] = set(pids_train_icu).union(set(pids_test_icu))
-            analysis_cohorts = {"all_at_risk": (pids_train_all, pids_test_all), "icu_only_head_to_head": (pids_train_icu, pids_test_icu)}
+
+            analysis_cohorts = {"all_admitted": (pids_train_all, pids_test_all), "icu_only_head_to_head": (pids_train_icu, pids_test_icu)}
 
             for group_name, (train_pids, test_pids) in analysis_cohorts.items():
                 logging.info(f"\n--- Running Analysis Group: '{group_name}' for {h}h landmark ---")
