@@ -1365,15 +1365,6 @@ def create_dynamic_features_from_patient_data(
                     xh = begin_g.index.total_seconds() / 3600.0
                     all_features[f"dyn_{var}_begin_slope"] = float(np.polyfit(xh, begin_g.values, 1)[0])
 
-        if H == 48:
-            mid_g = g_mean.loc[pd.to_timedelta(24, "h"):pd.to_timedelta(40, "h")].dropna()
-            nm = int(mid_g.size)
-            if nm > 0:
-                all_features[f"dyn_{var}_mid_mean"] = float(mid_g.mean())
-                if nm >= 2:
-                    xh = mid_g.index.total_seconds() / 3600.0
-                    all_features[f"dyn_{var}_mid_slope"] = float(np.polyfit(xh, mid_g.values, 1)[0])
-
         if end_h > 0:
             end_g = g_mean.loc[pd.to_timedelta(end_start_h, "h"):pd.to_timedelta(H, "h")].dropna()
             ne = int(end_g.size)
@@ -1442,7 +1433,7 @@ def create_dynamic_features_from_patient_data(
                             fname = f"evt_{true_var}_frac_{direction}_{t}_win_{start_h}_{end_h}h"
                             all_features[fname] = float(burden_frac)
 
-    # ---------- Burdens & Doses over full window, plus early/late at 48h ----------
+    # ---------- Burdens & Doses over full window ----------
     def _min_obs_by_h(h: int) -> int:
         return 180 if int(h) <= 24 else 240
     
@@ -1459,14 +1450,6 @@ def create_dynamic_features_from_patient_data(
                 val_abs = _single_burden(s_var, direction, float(t), grid_index, ffill_for_mask_minutes=ffill_for_masks, min_obs_minutes=_min_obs_by_h(H), return_minutes=True)
                 if pd.notna(val_abs): all_features[f"evt_{true_var}_abs_mins_{direction}_{t}"] = float(val_abs)
 
-                if H == 48:
-                    early_grid = pd.timedelta_range(start="0s", end="23:59:00", freq="1min")
-                    late_grid = pd.timedelta_range(start="24:00:00", end="48:00:00", freq="1min")
-                    val_frac_e = _single_burden(s_var, direction, float(t), early_grid, ffill_for_mask_minutes=ffill_for_masks, min_obs_minutes=120, return_minutes=False)
-                    if pd.notna(val_frac_e): all_features[f"evt_{true_var}_frac_{direction}_{t}_early"] = float(val_frac_e)
-                    val_frac_l = _single_burden(s_var, direction, float(t), late_grid, ffill_for_mask_minutes=ffill_for_masks, min_obs_minutes=120, return_minutes=False)
-                    if pd.notna(val_frac_l): all_features[f"evt_{true_var}_frac_{direction}_{t}_late"] = float(val_frac_l)
-
     # Doses (AUC-like)
     if "icpm" in name_map:
         g_icp_obs = _grid_align_noffill(patient_icu_df[name_map["icpm"]], grid_index)
@@ -1482,16 +1465,6 @@ def create_dynamic_features_from_patient_data(
                 all_features[base] = float(exc.sum())
                 all_features[base + "_per_hr"] = float(exc.sum()) / obs_hours
 
-                if H == 48:
-                    early_slice = g_icp.loc[:pd.to_timedelta("23:59:00")]
-                    late_slice = g_icp.loc[pd.to_timedelta("24:00:00"):]
-                    if early_slice.notna().any():
-                        e_exc = (early_slice - thr).clip(lower=0)
-                        all_features[base + "_early"] = float(e_exc.sum())
-                    if late_slice.notna().any():
-                        l_exc = (late_slice - thr).clip(lower=0)
-                        all_features[base + "_late"] = float(l_exc.sum())
-
     if "cpp" in name_map:
         g_cpp_obs = _grid_align_noffill(patient_icu_df[name_map["cpp"]], grid_index)
         g_cpp = _grid_align_generic(patient_icu_df[name_map["cpp"]], grid_index, ffill_minutes=ffill_for_means)
@@ -1504,19 +1477,6 @@ def create_dynamic_features_from_patient_data(
             all_features["dose_CPP_auc_lt_50"] = float(cpp50.sum())
             all_features["dose_CPP_auc_lt_60_per_hr"] = float(cpp60.sum()) / obs_hours_cpp
             all_features["dose_CPP_auc_lt_50_per_hr"] = float(cpp50.sum()) / obs_hours_cpp
-            if H == 48:
-                early_slice = g_cpp.loc[:pd.to_timedelta("23:59:00")]
-                late_slice = g_cpp.loc[pd.to_timedelta("24:00:00"):]
-                if early_slice.notna().any():
-                    e60 = (60 - early_slice).clip(lower=0)
-                    e50 = (50 - early_slice).clip(lower=0)
-                    all_features["dose_CPP_auc_lt_60_early"] = float(e60.sum())
-                    all_features["dose_CPP_auc_lt_50_early"] = float(e50.sum())
-                if late_slice.notna().any():
-                    l60 = (60 - late_slice).clip(lower=0)
-                    l50 = (50 - late_slice).clip(lower=0)
-                    all_features["dose_CPP_auc_lt_60_late"] = float(l60.sum())
-                    all_features["dose_CPP_auc_lt_50_late"] = float(l50.sum())
 
     # ---------- Event signature features (episodes / recovery) ----------
     es_cfg = fe_cfg.get("EVENT_SIGNATURE", {})
@@ -1763,7 +1723,7 @@ def audit_event_burdens_and_episodes(icu_df: pd.DataFrame, h: int, cfg: Dict, sp
     else:
         logging.info(f"[AUDIT {h}h/{split_label}] No ICP episode columns found (evt_ICPm_gt*_n_episodes).")
 
-    # ---------------- Joint events (double/triple) - NEW LOGIC ----------------
+    # ---------------- Joint events (double/triple) ----------------
     joint_rows = []
     
     patterns = {
